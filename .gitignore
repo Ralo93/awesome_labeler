@@ -2,6 +2,6 @@
 __pycache__/
 app/exports/*
 app/exports_tmp/*
-data/docs/*
+app/data/docs/*
 models/boundary_model.pkl
 .DS_Store
