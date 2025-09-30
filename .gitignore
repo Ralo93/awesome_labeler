@@ -1,2 +1,6 @@
 .pychache
 __pycache__/
+app/exports/*
+app/exports_tmp/*
+data/docs/*
+models/boundary_model.pkl
