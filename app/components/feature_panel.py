@@ -1,14 +1,12 @@
 import streamlit as st
 import pandas as pd
-from typing import List, Dict, Optional
-from core.schematas import Span
+from typing import List, Dict, Optional, Tuple
+from core.schematas import Span, Label
 
 def show_feature_panel(
-    selected_spans: List[str],
     spans: List[Span],
-    show_normalized: bool = True,
-    show_rules: bool = False,
-    rules: Optional[Dict] = None
+    labels: Dict[Tuple[int, str], Label], 
+    selected_spans: List[str]
 ):
     """Display feature panel for selected spans"""
     
@@ -22,36 +20,49 @@ def show_feature_panel(
     if not selected_objs:
         return
     
-    # Create feature dataframe
+    st.subheader("📊 Span Features")
+    
+    # Create feature dataframe following MVP focus
     data = []
     for span in selected_objs:
+        span_key = (span.page_number, span.span_id)
+        label = labels.get(span_key)
+        
         row = {
             'Span ID': span.span_id,
             'Text': span.text[:30] + "..." if len(span.text) > 30 else span.text,
             'Font Size': span.font_size,
             'Bold': '✓' if span.bold else '✗',
             'Italic': '✓' if span.italic else '✗',
-            'Line Height': span.line_height,
+            'Line Height': f"{span.line_height:.1f}",
             'Column': span.column,
-            'Reading Order': span.reading_order
+            'Reading Order': span.reading_order,
+            'X Center': f"{span.x_center:.1f}",
+            'Y Bottom': f"{span.y_bottom:.1f}",
         }
         
-        if show_normalized:
-            # Add normalized features
-            row.update({
-                'X Norm': f"{span.x_center / 595.0:.3f}",  # Normalized to page width
-                'Y Norm': f"{span.y_bottom / 842.0:.3f}",  # Normalized to page height
-            })
-        
-        if show_rules and rules and span.span_id in rules:
-            rule = rules[span.span_id]
-            row.update({
-                'Header': '✓' if rule.is_header else '✗',
-                'Caption': '✓' if rule.is_caption else '✗',
-                'Page Num': '✓' if rule.is_page_num else '✗'
-            })
+        # Add label info if available (following state management pattern)
+        if label:
+            row['Boundary'] = label.boundary
+            row['Unit ID'] = label.unit_id
+            row['Confidence'] = f"{label.confidence:.3f}"
+        else:
+            row['Boundary'] = 'unlabeled'
+            row['Unit ID'] = '-'
+            row['Confidence'] = '-'
         
         data.append(row)
     
     df = pd.DataFrame(data)
     st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Show bounding boxes for debugging (following debugging patterns)
+    #if st.checkbox("Show Bounding Boxes"):
+    #    st.json({
+    #        span.span_id: {
+    #            'bbox': span.bbox,
+    #            'page': span.page_number,
+    #            'text_preview': span.text[:50]
+    #        }
+    #        for span in selected_objs
+    #    })

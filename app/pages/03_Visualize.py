@@ -195,7 +195,7 @@ if selected_doc:
 st.divider()
 st.subheader("📚 Existing Visualizations")
 
-export_dir = Path("exports")
+export_dir = Path("exports_comparisons")
 if export_dir.exists():
     pdf_files = list(export_dir.glob("comparison_*.pdf"))
     

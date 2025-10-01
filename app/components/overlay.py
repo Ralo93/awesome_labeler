@@ -26,6 +26,7 @@ def draw_overlay(
     selected_spans: List[str],
     predictions: Optional[Dict[Tuple[str, str], float]] = None,
     show_heatmap: bool = True,
+    show_unit_numbers: bool = True,
     zoom: float = 1.0
 ) -> Image.Image:
     """Draw overlay on document image with units and boundaries"""
@@ -33,6 +34,15 @@ def draw_overlay(
     # Create overlay with transparency
     overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
+    
+    # Load font for unit numbers
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", size=int(14 * zoom))
+    except:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", int(14 * zoom))
+        except:
+            font = ImageFont.load_default()
     
     # First pass: Group spans by unit
     units = {}
@@ -49,6 +59,14 @@ def draw_overlay(
                 unit_order[unit_id] = len(unit_order)
             units[unit_id].append(span)
     
+    # Sort units by reading order of first span in each unit
+    sorted_units = []
+    for unit_id, unit_spans in units.items():
+        # Find first span by reading order
+        first_span = min(unit_spans, key=lambda s: s.reading_order or 999999)
+        sorted_units.append((first_span.reading_order or 999999, unit_id, unit_spans))
+    sorted_units.sort()
+    
     # Draw units (background colors)
     for unit_id, unit_spans in units.items():
         color = get_unit_color(unit_order[unit_id], alpha=40)
@@ -60,26 +78,45 @@ def draw_overlay(
             # Draw filled rectangle for unit
             draw.rectangle(bbox, fill=color, outline=None)
     
-    # # Draw boundaries between units
-    # for i, span in enumerate(spans):
-    #     key = (span.page, span.span_id)
-    #     if key in labels:
-    #         label = labels[key]
+    # Draw semantic unit numbers
+    if show_unit_numbers and sorted_units:
+        for unit_idx, (_, unit_id, unit_spans) in enumerate(sorted_units):
+            # Find the topmost, leftmost span in the unit for positioning
+            first_span = min(unit_spans, key=lambda s: (s.bbox[1], s.bbox[0]))
             
-    #         if label.boundary == "new" and i > 0:
-    #             # Draw boundary line above this span
-    #             bbox = [coord * zoom for coord in span.bbox]
-    #             prev_span = spans[i-1] if i > 0 else None
-                
-    #             if prev_span:
-    #                 prev_bbox = [coord * zoom for coord in prev_span.bbox]
-    #                 # Draw line between spans
-    #                 y_pos = (prev_bbox[3] + bbox[1]) / 2
-    #                 draw.line(
-    #                     [(0, y_pos), (image.width, y_pos)],
-    #                     fill=(255, 0, 0, 100),
-    #                     width=2
-    #                 )
+            bbox = [coord * zoom for coord in first_span.bbox]
+            x0, y0 = bbox[0], bbox[1]
+            
+            # Unit number text
+            unit_num = unit_idx + 1
+            unit_text = f"#{unit_num}"
+            
+            # Get text dimensions for box sizing
+            text_bbox = draw.textbbox((0, 0), unit_text, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            
+            # Box padding
+            padding = int(3 * zoom)
+            box_width = text_width + 2 * padding
+            box_height = text_height + 2 * padding
+            
+            # Position box at top-left of semantic unit, slightly offset
+            box_x = max(0, x0 - int(5 * zoom))
+            box_y = max(0, y0 - box_height - int(5 * zoom))
+            
+            # Draw unit number box background (dark blue)
+            draw.rectangle(
+                [box_x, box_y, box_x + box_width, box_y + box_height],
+                fill=(25, 25, 112, 230),  # Dark blue background
+                outline=(255, 255, 255, 255),  # White border
+                width=max(1, int(zoom))
+            )
+            
+            # Draw unit number text (white)
+            text_x = box_x + padding
+            text_y = box_y + padding
+            draw.text((text_x, text_y), unit_text, fill=(255, 255, 255, 255), font=font)
     
     # Draw predictions/confidence if available
     if show_heatmap and predictions:
@@ -116,15 +153,15 @@ def draw_overlay(
                 
                 # Add probability text
                 try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", int(10 * zoom))
+                    prob_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", int(10 * zoom))
                 except:
-                    font = None
+                    prob_font = font
                 
                 draw.text(
                     (margin + bar_width + 5, y_center - 5),
                     f"{prob:.2f}",
                     fill=(100, 100, 100, 255),
-                    font=font
+                    font=prob_font
                 )
     
     # Draw selected spans (on top)

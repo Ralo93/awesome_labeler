@@ -1,47 +1,24 @@
-# app/pages/01_Label.py
 import streamlit as st
-from pathlib import Path
 import sys
+from pathlib import Path
 from PIL import Image
 import io
-import numpy as np
-import pandas as pd
-import joblib
-import copy
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
-
+import joblib
 from app.state import AppState
 from app.components.overlay import draw_overlay
 from app.components.feature_panel import show_feature_panel
 from core.io import load_spans, load_labels, save_labels
 from core.pdf_processor import render_pdf_page
 from core.schematas import Label
-from core.features import compute_pairwise_features
+from core.features import compute_sliding_window_features
 
 st.set_page_config(page_title="Label", page_icon="🏷️", layout="wide")
-st.markdown(
-    """
-    <script>
-    document.addEventListener("keydown", function(event) {
-        // Use lowercase 'm' for merge
-        if (event.key === "m" || event.key === "M") {
-            // Find the hidden merge button and click it
-            var btn = window.parent.document.querySelector('button[data-merge-key]');
-            if (btn) { btn.click(); }
-        }
-    });
-    </script>
-    """,
-    unsafe_allow_html=True
-)
 
 AppState.init()
 
 st.title("🏷️ Labeling Interface")
-
-# --- CSS tweaks for smaller span/unit buttons ---
-
 
 # Initialize label tracking
 if 'unit_counter' not in st.session_state:
@@ -53,576 +30,565 @@ if 'model' not in st.session_state:
 if 'model_name' not in st.session_state:
     st.session_state.model_name = None
 
+# Auto-load document if available but not loaded
+if not st.session_state.current_doc:
+    data_dir = Path("data/docs")
+    if data_dir.exists():
+        doc_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+        if doc_dirs:
+            # Auto-load the most recently created document
+            latest_doc = max(doc_dirs, key=lambda d: d.stat().st_mtime)
+            AppState.load_document_data(latest_doc.name)
+
 def load_model(model_path: Path):
     """Load a trained boundary model"""
     try:
-        model_data = joblib.load(model_path)
         
-        # Handle different model formats
-        if isinstance(model_data, dict):
-            # New format with metadata
-            st.session_state.model = model_data.get('model')
-            st.session_state.model_metadata = model_data.get('metadata', {})
-            st.session_state.model_features = model_data.get('feature_columns', [])
-        else:
-            # Old format - just the model
-            st.session_state.model = model_data
-            st.session_state.model_metadata = {}
-            st.session_state.model_features = []
-        
-        st.session_state.model_name = model_path.stem.replace('_model', '')
-        return True
+        model = joblib.load(model_path)
+        st.session_state.model = model
+        st.session_state.model_name = model_path.name
+        st.success(f"✅ Model loaded: {model_path.name}")
     except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        return False
-
-def compute_features_for_model(prev_span, curr_span):
-    """Compute features matching the trained model's expectations"""
-    features = compute_pairwise_features(prev_span, curr_span)
-    
-    # Add missing features that the model expects
-    # Linebreak flag - check if there's a significant vertical gap suggesting a line break
-    avg_height = (prev_span.height + curr_span.height) / 2 if (prev_span.height + curr_span.height) > 0 else 20
-    vertical_gap = curr_span.y_bottom - prev_span.y_bottom
-    features['linebreak_flag'] = 1 if vertical_gap > avg_height * 0.5 else 0
-    
-    # Hyphenation flag - already computed as prev_ends_with_hyphen, but also add the specific flag
-    features['hyphenation_flag'] = features.get('prev_ends_with_hyphen', 0)
-    
-    return features
+        st.error(f"❌ Failed to load model: {e}")
 
 def apply_model_predictions(page_only: bool = True, overwrite: bool = False):
-    """Apply model predictions to create semantic units"""
+    """Apply model predictions using sliding window features"""
     if not st.session_state.model:
-        st.warning("No model loaded")
-        return False
+        st.error("No model loaded!")
+        return
     
-    spans = load_spans(st.session_state.current_doc)
+    spans = AppState.get_current_spans()
+    if not spans:
+        return
     
+    # Filter to current page if requested
     if page_only:
-        # Filter to current page
-        target_spans = [s for s in spans if s.page_number == st.session_state.current_page]
-        pages_to_process = [st.session_state.current_page]
+        page_spans = [s for s in spans if s.page_number == st.session_state.current_page]
+        span_indices = [i for i, s in enumerate(spans) if s.page_number == st.session_state.current_page]
     else:
-        # Process all pages
-        target_spans = spans
-        pages_to_process = sorted(set(s.page_number for s in spans))
+        page_spans = spans
+        span_indices = list(range(len(spans)))
     
-    total_boundaries = 0
-    created_units = 0
-    skipped_spans = 0
+    if not page_spans:
+        return
     
-    # Store old state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
-    
-    for page_num in pages_to_process:
-        page_spans = sorted([s for s in target_spans if s.page_number == page_num],
-                           key=lambda s: s.reading_order)
-        
-        if len(page_spans) < 2:
+    # Generate predictions using sliding window features
+    predictions = {}
+    for local_idx, (global_idx, span) in enumerate(zip(span_indices, page_spans)):
+        # Skip if already labeled and not overwriting
+        key = (span.page_number, span.span_id)
+        if key in st.session_state.labels and not overwrite:
             continue
         
-        # Compute features for ALL consecutive pairs
-        rows = []
-        span_pairs = []
+        # Extract features using sliding window approach (pass global index)
+        features = compute_sliding_window_features(spans, global_idx)
         
-        for i in range(1, len(page_spans)):
-            prev_span = page_spans[i-1]
-            curr_span = page_spans[i]
-            
-            # Check if already labeled (for statistics)
-            if not overwrite and (page_num, curr_span.span_id) in st.session_state.labels:
-                skipped_spans += 1
-                continue
-            
-            features = compute_features_for_model(prev_span, curr_span)
-            rows.append(features)
-            span_pairs.append((prev_span, curr_span))
+        # Convert to feature vector matching model expectations
+        if hasattr(st.session_state.model, 'feature_names_in_'):
+            feature_vector = [features.get(name, 0.0) for name in st.session_state.model.feature_names_in_]
+        else:
+            # Fallback: use all numeric features
+            feature_vector = [v for v in features.values() if isinstance(v, (int, float))]
         
-        if not rows:
-            if skipped_spans > 0:
-                st.info(f"All {skipped_spans} spans on page {page_num} are already labeled. Use 'Clear Page' first or enable overwrite.")
-            continue
-        
-        # Make predictions
-        df = pd.DataFrame(rows)
-        
-        # Get probability of boundary
+        # Predict boundary probability
         try:
-            if hasattr(st.session_state.model, 'predict_proba'):
-                probs = st.session_state.model.predict_proba(df)[:, 1]
-            else:
-                # Fallback for models without predict_proba
-                probs = st.session_state.model.predict(df)
+            prob = st.session_state.model.predict_proba([feature_vector])[0][1]  # Prob of boundary
+            predictions[key] = prob
         except Exception as e:
-            st.error(f"Model prediction failed: {e}")
-            # Diagnostic info
-            st.write("Features in data:", df.columns.tolist())
-            if hasattr(st.session_state.model, 'feature_names_in_'):
-                st.write("Features expected by model:", st.session_state.model.feature_names_in_.tolist())
+            st.error(f"Prediction error for {span.span_id}: {e}")
             continue
+    
+    # Store predictions in session state for heatmap
+    if 'predictions' not in st.session_state:
+        st.session_state.predictions = {}
+    st.session_state.predictions.update(predictions)
+    
+    st.success(f"Generated {len(predictions)} predictions")
+
+def merge_selected_spans():
+    """Merge selected spans into a single semantic unit"""
+    if not st.session_state.selected_spans:
+        st.warning("No spans selected for merging")
+        return
+    
+    spans = AppState.get_current_spans()
+    selected_span_objs = [s for s in spans if s.span_id in st.session_state.selected_spans]
+    
+    if not selected_span_objs:
+        return
+    
+    # Sort by reading order
+    selected_span_objs.sort(key=lambda s: (s.page_number, s.reading_order))
+    
+    # Generate new unit ID
+    st.session_state.unit_counter += 1
+    unit_id = f"unit_{st.session_state.unit_counter}"
+    
+    # Create labels for all spans
+    labels_to_add = {}
+    for i, span in enumerate(selected_span_objs):
+        key = (span.page_number, span.span_id)
+        boundary = "new" if i == 0 else "continue"
         
-        # Apply threshold (default 0.5, can be adjusted)
-        threshold = st.session_state.get('model_threshold', 0.5)
-        boundaries = probs >= threshold
-        
-        # Create semantic units based on boundaries
-        current_unit_id = None
-        
-        for idx, (prev_span, curr_span) in enumerate(span_pairs):
-            is_boundary = boundaries[idx]
-            
-            # Check if previous span is labeled
-            prev_key = (page_num, prev_span.span_id)
-            if prev_key not in st.session_state.labels:
-                # Label the previous span if not already done
-                if current_unit_id is None:
-                    st.session_state.unit_counter += 1
-                    current_unit_id = f"SU_{st.session_state.unit_counter:04d}"
-                    created_units += 1
-                
-                st.session_state.labels[prev_key] = Label(
-                    doc_id=st.session_state.current_doc,
-                    page_number=page_num,
-                    span_id=prev_span.span_id,
-                    unit_id=current_unit_id,
-                    boundary="new" if current_unit_id.endswith(f"{st.session_state.unit_counter:04d}") else "continue",
-                    confidence=int(probs[idx] * 5) if idx < len(probs) else 3
-                )
-            
-            # Label current span
-            curr_key = (page_num, curr_span.span_id)
-            
-            if is_boundary:
-                # Start new unit
-                st.session_state.unit_counter += 1
-                current_unit_id = f"SU_{st.session_state.unit_counter:04d}"
-                boundary_label = "new"
-                created_units += 1
-                total_boundaries += 1
-            else:
-                # Continue current unit
-                if current_unit_id is None:
-                    st.session_state.unit_counter += 1
-                    current_unit_id = f"SU_{st.session_state.unit_counter:04d}"
-                    created_units += 1
-                boundary_label = "continue"
-            
-            st.session_state.labels[curr_key] = Label(
-                doc_id=st.session_state.current_doc,
-                page_number=page_num,
-                span_id=curr_span.span_id,
-                unit_id=current_unit_id,
-                boundary=boundary_label,
-                confidence=int((1 - abs(probs[idx] - 0.5) * 2) * 5) if idx < len(probs) else 3
-            )
-        
-        # Label any remaining spans on the page
-        for span in page_spans:
-            key = (page_num, span.span_id)
-            if key not in st.session_state.labels:
-                if current_unit_id is None:
-                    st.session_state.unit_counter += 1
-                    current_unit_id = f"SU_{st.session_state.unit_counter:04d}"
-                    created_units += 1
-                
-                st.session_state.labels[key] = Label(
-                    doc_id=st.session_state.current_doc,
-                    page_number=page_num,
-                    span_id=span.span_id,
-                    unit_id=current_unit_id,
-                    boundary="continue",
-                    confidence=1
-                )
+        label = Label(
+            span_id=span.span_id,
+            page_number=span.page_number,
+            boundary=boundary,
+            unit_id=unit_id,
+            confidence=1.0
+        )
+        labels_to_add[key] = label
     
     # Add to undo stack
     AppState.add_to_undo_stack({
-        'type': 'apply_model',
-        'old_labels': old_labels,
-        'new_labels': copy.deepcopy(st.session_state.labels)
+        'labels_added': labels_to_add,
+        'selected_spans': st.session_state.selected_spans.copy()
     })
     
-    AppState.mark_dirty()
+    # Update labels
+    st.session_state.labels.update(labels_to_add)
+    st.session_state.selected_spans = []
     
-    if page_only:
-        st.success(f"Applied model to page {st.session_state.current_page}: {created_units} units created, {total_boundaries} boundaries detected")
-    else:
-        st.success(f"Applied model to document: {created_units} units created across {len(pages_to_process)} pages")
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
     
-    return True
-def merge_selected_spans():
-    # Allow 1+ selected spans (single = create its own unit)
-    if not st.session_state.selected_spans:
-        st.warning("Please select at least 1 span to create or merge a unit")
-        return
-    
-    # Save state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
-    
-    spans = load_spans(st.session_state.current_doc)
-    page_spans = sorted(
-        [s for s in spans if s.page_number == st.session_state.current_page],
-        key=lambda s: (s.line_id if s.line_id is not None else 10**9,
-                       s.reading_order if s.reading_order is not None else 10**9)
-    )
-    
-    selected = [s for s in page_spans if s.span_id in st.session_state.selected_spans]
-    selected.sort(key=lambda s: s.reading_order)
-    
-    if selected:
-        st.session_state.unit_counter += 1
-        unit_id = f"SU_{st.session_state.unit_counter:04d}"
-        
-        for i, span in enumerate(selected):
-            key = (st.session_state.current_page, span.span_id)
-            st.session_state.labels[key] = Label(
-                doc_id=st.session_state.current_doc,
-                page_number=st.session_state.current_page,
-                span_id=span.span_id,
-                unit_id=unit_id,
-                boundary="new" if i == 0 else "continue",
-                confidence=st.session_state.get('confidence_level', 3) if st.session_state.confidence_mode else None
-            )
-        
-        # Add undo action
-        AppState.add_to_undo_stack({
-            'type': 'merge_spans' if len(selected) > 1 else 'create_unit_single',
-            'old_labels': old_labels,
-            'new_labels': copy.deepcopy(st.session_state.labels)
-        })
-        
-        AppState.mark_dirty()
-        st.session_state.selected_spans = []
-        st.success(f"Created unit {unit_id} with {len(selected)} span{'s' if len(selected)!=1 else ''}")
-        st.rerun()
-
-import re
-
-def is_number_only(text: str) -> bool:
-    """Return True if text is ONLY a number (int or decimal), allowing optional sign and whitespace."""
-    if text is None:
-        return False
-    # Accepts: "123", "-42", "+7", "3.14", "2,5" (comma or dot decimal), with surrounding spaces
-    return bool(re.match(r'^\s*[+-]?\d+(?:[.,]\d+)?\s*$', text))
-
-
-def enforce_digit_units():
-    """Put every span containing a digit into its own semantic unit on the current page.
-       Overwrites labels for those spans and fixes boundaries of affected original units.
-    """
-    spans = load_spans(st.session_state.current_doc)
-    page_spans = sorted(
-        [s for s in spans if s.page_number == st.session_state.current_page],
-        key=lambda s: (s.line_id if s.line_id is not None else 10**9,
-                       s.reading_order if s.reading_order is not None else 10**9)
-    )
-
-    # Find spans that contain at least one digit
-    # Find spans whose text is ONLY a number
-    digit_spans = [s for s in page_spans if is_number_only(getattr(s, "text", ""))]
-
-
-    if not digit_spans:
-        st.info("No digit-containing spans found on this page.")
-        return
-
-    # Save state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
-
-    # Map original units on page (before changes) to their spans (ordered)
-    original_units = {}
-    for s in page_spans:
-        k = (st.session_state.current_page, s.span_id)
-        if k in st.session_state.labels:
-            uid = st.session_state.labels[k].unit_id
-        else:
-            # Also consider previously saved labels (if any) to track pre-change memberships
-            label_pre = next((lbl for lbl in load_labels(st.session_state.current_doc)
-                              if lbl.page_number == st.session_state.current_page and lbl.span_id == s.span_id), None)
-            uid = label_pre.unit_id if label_pre else None
-        if uid:
-            original_units.setdefault(uid, []).append(s)
-
-    # Assign each digit span to its own new unit
-    for s in digit_spans:
-        st.session_state.unit_counter += 1
-        new_uid = f"SU_{st.session_state.unit_counter:04d}"
-        key = (st.session_state.current_page, s.span_id)
-        st.session_state.labels[key] = Label(
-            doc_id=st.session_state.current_doc,
-            page_number=st.session_state.current_page,
-            span_id=s.span_id,
-            unit_id=new_uid,
-            boundary="new",
-            confidence=1 if st.session_state.confidence_mode else None
-        )
-
-    # Fix boundary flags for any original units that lost one or more digit spans
-    # Ensure the first remaining span in each affected unit is marked "new", others "continue"
-    affected_units = set()
-    for s in digit_spans:
-        # Find which (old) unit this span was in based on old_labels
-        k = (st.session_state.current_page, s.span_id)
-        if k in old_labels:
-            affected_units.add(old_labels[k].unit_id)
-
-    for uid in affected_units:
-        if uid not in original_units:
-            continue
-        remaining = [s for s in original_units[uid] if s not in digit_spans]
-        # Keep old unit id on remaining spans; just fix boundary flags
-        for i, s in enumerate(remaining):
-            k = (s.page_number, s.span_id)
-            if k in st.session_state.labels and st.session_state.labels[k].unit_id == uid:
-                st.session_state.labels[k].boundary = "new" if i == 0 else "continue"
-
-    # Add undo action
-    AppState.add_to_undo_stack({
-        'type': 'digits_to_single_units',
-        'old_labels': old_labels,
-        'new_labels': copy.deepcopy(st.session_state.labels)
-    })
-
-    AppState.mark_dirty()
-    st.success(f"Assigned {len(digit_spans)} digit span{'s' if len(digit_spans)!=1 else ''} to their own semantic unit{'s' if len(digit_spans)!=1 else ''}.")
-    st.rerun()
-
+    st.success(f"Merged {len(selected_span_objs)} spans into {unit_id}")
 
 def auto_label_remaining():
-    # Save state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
-    
-    spans = load_spans(st.session_state.current_doc)
-    page_spans = [s for s in spans if s.page_number == st.session_state.current_page]
-    
-    labeled_count = 0
-    for span in page_spans:
-        key = (st.session_state.current_page, span.span_id)
-        if key in st.session_state.labels:
-            continue
-        
-        st.session_state.unit_counter += 1
-        unit_id = f"SU_{st.session_state.unit_counter:04d}"
-        
-        st.session_state.labels[key] = Label(
-            doc_id=st.session_state.current_doc,
-            page_number=st.session_state.current_page,
-            span_id=span.span_id,
-            unit_id=unit_id,
-            boundary="new",
-            confidence=1 if st.session_state.confidence_mode else None
-        )
-        labeled_count += 1
-    
-    if labeled_count > 0:
-        # Add undo action
-        AppState.add_to_undo_stack({
-            'type': 'auto_label',
-            'old_labels': old_labels,
-            'new_labels': copy.deepcopy(st.session_state.labels)
-        })
-        
-        AppState.mark_dirty()
-        st.success(f"Auto-labeled {labeled_count} remaining spans as individual units")
-        st.rerun()
-    else:
-        st.info("All spans are already labeled")
-
-def clear_page_labels():
-    # Save state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
-    
-    keys_to_remove = [k for k in st.session_state.labels if k[0] == st.session_state.current_page]
-    
-    for k in keys_to_remove:
-        del st.session_state.labels[k]
-    
-    if keys_to_remove:
-        # Add undo action
-        AppState.add_to_undo_stack({
-            'type': 'clear_page',
-            'old_labels': old_labels,
-            'new_labels': copy.deepcopy(st.session_state.labels)
-        })
-        
-        AppState.mark_dirty()
-        st.success(f"Cleared {len(keys_to_remove)} labels")
-        st.rerun()
-
-def split_unit():
-    if not st.session_state.selected_spans:
-        st.warning("Please select a span where you want to split")
+    """Auto-label remaining unlabeled spans on the current page using model predictions"""
+    if not st.session_state.model:
+        st.error("No model loaded!")
         return
     
-    # Save state for undo
-    old_labels = copy.deepcopy(st.session_state.labels)
+    spans = AppState.get_current_spans()
+    if not spans:
+        return
     
-    spans = load_spans(st.session_state.current_doc)
-    page_spans = sorted([s for s in spans if s.page_number == st.session_state.current_page],
-                       key=lambda s: s.reading_order)
+    # Get current page number
+    current_page = st.session_state.current_page
     
-    for span_id in st.session_state.selected_spans:
-        key = (st.session_state.current_page, span_id)
+    # Filter spans to current page only
+    page_spans = [s for s in spans if s.page_number == current_page]
+    
+    if not page_spans:
+        st.info("No spans on current page!")
+        return
+    
+    # Find unlabeled spans on current page
+    unlabeled_spans = []
+    for span in page_spans:
+        key = (span.page_number, span.span_id)
         if key not in st.session_state.labels:
-            continue
-        
-        original_unit = st.session_state.labels[key].unit_id
-        
-        unit_spans = []
-        for span in page_spans:
-            span_key = (span.page_number, span.span_id)
-            if span_key in st.session_state.labels and st.session_state.labels[span_key].unit_id == original_unit:
-                unit_spans.append(span)
-        
-        split_span = next((s for s in unit_spans if s.span_id == span_id), None)
-        if not split_span:
-            continue
-        
-        split_index = unit_spans.index(split_span)
-        
-        if split_index < len(unit_spans) - 1:
-            st.session_state.unit_counter += 1
-            new_unit_id = f"SU_{st.session_state.unit_counter:04d}"
-            
-            for i, span in enumerate(unit_spans[split_index:]):
-                span_key = (span.page_number, span.span_id)
-                st.session_state.labels[span_key].unit_id = new_unit_id
-                st.session_state.labels[span_key].boundary = "new" if i == 0 else "continue"
-            
-            # Add undo action
-            AppState.add_to_undo_stack({
-                'type': 'split_unit',
-                'old_labels': old_labels,
-                'new_labels': copy.deepcopy(st.session_state.labels)
-            })
-            
-            st.success(f"Split unit {original_unit} into two units")
-            AppState.mark_dirty()
+            unlabeled_spans.append(span)
     
+    if not unlabeled_spans:
+        st.info("All spans on this page already labeled!")
+        return
+    
+    # Generate unit IDs for high-confidence boundaries
+    threshold = st.session_state.get('boundary_threshold', 0.5)
+    current_unit_id = f"unit_{st.session_state.unit_counter + 1}"
+    labels_to_add = {}
+    
+    for span in unlabeled_spans:
+        key = (span.page_number, span.span_id)
+        
+        # Get prediction
+        prob = st.session_state.predictions.get(key, 0.0)
+        
+        # Determine if this starts a new unit
+        is_new_unit = prob >= threshold
+        if is_new_unit:
+            st.session_state.unit_counter += 1
+            current_unit_id = f"unit_{st.session_state.unit_counter}"
+            boundary = "new"
+        else:
+            boundary = "continue"
+        
+        label = Label(
+            span_id=span.span_id,
+            page_number=span.page_number,
+            boundary=boundary,
+            unit_id=current_unit_id,
+            confidence=float(prob)
+        )
+        labels_to_add[key] = label
+    
+    # Add to undo stack
+    AppState.add_to_undo_stack({
+        'labels_added': labels_to_add
+    })
+    
+    # Update labels
+    st.session_state.labels.update(labels_to_add)
+    
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
+    
+    st.success(f"Auto-labeled {len(labels_to_add)} spans on page {current_page}")
+
+def clear_page_labels():
+    """Clear all labels on current page"""
+    page_num = st.session_state.current_page
+    
+    # Find labels to remove
+    labels_to_remove = {}
+    for key, label in st.session_state.labels.items():
+        if key[0] == page_num:
+            labels_to_remove[key] = label
+    
+    if not labels_to_remove:
+        st.info("No labels to clear on this page")
+        return
+    
+    # Add to undo stack
+    AppState.add_to_undo_stack({
+        'labels_removed': labels_to_remove
+    })
+    
+    # Remove labels
+    for key in labels_to_remove:
+        del st.session_state.labels[key]
+    
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
+    
+    st.success(f"Cleared {len(labels_to_remove)} labels from page {page_num}")
+
+def split_unit():
+    """Split selected spans into separate units"""
+    if not st.session_state.selected_spans:
+        st.warning("No spans selected for splitting")
+        return
+    
+    spans = AppState.get_current_spans()
+    selected_span_objs = [s for s in spans if s.span_id in st.session_state.selected_spans]
+    
+    labels_to_add = {}
+    labels_removed = {}
+    
+    for span in selected_span_objs:
+        key = (span.page_number, span.span_id)
+        
+        # Store old label for undo
+        if key in st.session_state.labels:
+            labels_removed[key] = st.session_state.labels[key]
+        
+        # Create new unit
+        st.session_state.unit_counter += 1
+        unit_id = f"unit_{st.session_state.unit_counter}"
+        
+        label = Label(
+            span_id=span.span_id,
+            page_number=span.page_number,
+            boundary="new",
+            unit_id=unit_id,
+            confidence=1.0
+        )
+        labels_to_add[key] = label
+    
+    # Add to undo stack
+    AppState.add_to_undo_stack({
+        'labels_added': labels_to_add,
+        'labels_removed': labels_removed
+    })
+    
+    # Update labels
+    st.session_state.labels.update(labels_to_add)
     st.session_state.selected_spans = []
-    st.rerun()
+    
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
+    
+    st.success(f"Split {len(selected_span_objs)} spans into separate units")
 
 def undo_action():
-    """Custom undo handler for label operations"""
-    if st.session_state.undo_stack:
-        action = st.session_state.undo_stack.pop()
-        
-        # Save current state to redo stack
-        current_state = {
-            'type': action['type'],
-            'old_labels': action['new_labels'],
-            'new_labels': action['old_labels']
-        }
-        st.session_state.redo_stack.append(current_state)
-        
-        # Restore old labels
-        st.session_state.labels = copy.deepcopy(action['old_labels'])
-        st.success("Undone last action")
-        return True
-    else:
-        st.warning("Nothing to undo")
-        return False
+    """Undo last action"""
+    AppState.undo()
 
 def save_current_labels():
-    if st.session_state.current_doc and st.session_state.labels:
-        save_labels(st.session_state.current_doc, list(st.session_state.labels.values()))
-        AppState.mark_clean()
+    """Save current labels to disk"""
+    if st.session_state.current_doc:
+        save_labels(st.session_state.current_doc, st.session_state.labels)
         st.success("Labels saved!")
-        return True
-    return False
+
+def toggle_span_selection(span_id: str):
+    """Toggle span selection and force rerun for instant feedback"""
+    if span_id in st.session_state.selected_spans:
+        st.session_state.selected_spans.remove(span_id)
+    else:
+        st.session_state.selected_spans.append(span_id)
+    
+    # Mark state as changed for instant overlay update
+    AppState.mark_dirty()
 
 def next_uncertain():
-    if st.session_state.predictions:
-        # Find the boundary with probability closest to 0.5
-        most_uncertain = None
-        min_certainty = 1.0
-        
-        for (span_prev, span_curr), prob in st.session_state.predictions.items():
-            certainty = abs(prob - 0.5)
-            if certainty < min_certainty:
-                min_certainty = certainty
-                most_uncertain = (span_prev, span_curr, prob)
-        
-        if most_uncertain:
-            span_prev, span_curr, prob = most_uncertain
-            st.session_state.selected_spans = [span_prev, span_curr]
-            st.info(f"Most uncertain boundary: {span_prev} & {span_curr} (P={prob:.3f})")
-            st.rerun()
+    """Navigate to next span with uncertain prediction"""
+    if not st.session_state.predictions:
+        st.warning("No predictions available")
+        return
+    
+    # Find uncertain predictions (around 0.5 probability)
+    uncertain_spans = []
+    for key, prob in st.session_state.predictions.items():
+        if 0.3 <= prob <= 0.7:  # Uncertain range
+            uncertain_spans.append((key, abs(prob - 0.5)))
+    
+    if not uncertain_spans:
+        st.info("No uncertain predictions found")
+        return
+    
+    # Sort by uncertainty (closest to 0.5)
+    uncertain_spans.sort(key=lambda x: x[1])
+    
+    # Navigate to most uncertain
+    page_num, span_id = uncertain_spans[0][0]
+    st.session_state.current_page = page_num
+    st.session_state.selected_spans = [span_id]
+    
+    st.success(f"Navigated to uncertain span: {span_id}")
 
 # Model loading sidebar
 with st.sidebar:
-    st.header("🤖 Model Management")
+    st.header("📄 Document")
     
-    models_dir = Path("/Users/rvonlottne001/repositories/GPT4Gov-Doc_Translation/backend_pdf/training_SU_model/app/models")
-    if models_dir.exists():
-        model_files = list(models_dir.glob("*_model.pkl"))
+    data_dir = Path("data/docs")
+    available_docs = []
+    if data_dir.exists():
+        available_docs = [d.name for d in data_dir.iterdir() if d.is_dir()]
+    
+    if available_docs:
+        current_doc_index = 0
+        if st.session_state.current_doc and st.session_state.current_doc in available_docs:
+            current_doc_index = available_docs.index(st.session_state.current_doc)
         
-        if model_files:
-            model_names = [f.stem.replace('_model', '') for f in model_files]
-            
-            selected_model = st.selectbox(
-                "Select Model",
-                ["None"] + model_names,
-                index=0 if st.session_state.model_name is None else 
-                      (model_names.index(st.session_state.model_name) + 1 
-                       if st.session_state.model_name in model_names else 0)
-            )
-            
-            if selected_model != "None":
-                model_path = models_dir / f"{selected_model}_model.pkl"
-                if st.button("📥 Load Model", use_container_width=True):
-                    if load_model(model_path):
-                        st.success(f"Loaded model: {selected_model}")
-                        st.rerun()
-            
-            if st.session_state.model:
-                st.success(f"✅ Model loaded: {st.session_state.model_name}")
-                
-                # Model application controls
-                st.divider()
-                st.subheader("Apply Model")
-                
-                st.session_state.model_threshold = st.slider(
-                    "Boundary Threshold",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=0.5,
-                    step=0.05,
-                    help="Probability threshold for detecting boundaries"
-                )
-                
-                overwrite = st.checkbox(
-                    "Overwrite existing labels",
-                    value=False,
-                    help="Replace existing labels with model predictions"
-                )
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("📄 Apply to Page", use_container_width=True,
-                                help="Apply model to current page only"):
-                        if apply_model_predictions(page_only=True, overwrite=overwrite):
-                            st.rerun()
-                
-                with col2:
-                    if st.button("📚 Apply to Document", use_container_width=True,
-                                help="Apply model to entire document"):
-                        if apply_model_predictions(page_only=False, overwrite=overwrite):
-                            st.rerun()
-                
-                # Model info
-                if st.session_state.get('model_metadata'):
-                    st.divider()
-                    st.caption("Model Info")
-                    meta = st.session_state.model_metadata
-                    if 'test_accuracy' in meta:
-                        st.metric("Test Accuracy", f"{meta['test_accuracy']:.3f}")
-                    if 'feature_count' in meta:
-                        st.metric("Features", meta['feature_count'])
-        else:
-            st.info("No trained models found in app/models/")
+        selected_doc = st.selectbox(
+            "Select Document",
+            available_docs,
+            index=current_doc_index,
+            key="doc_selector"
+        )
+        
+        # Load new document if selection changed
+        if selected_doc != st.session_state.current_doc:
+            AppState.load_document_data(selected_doc)
+            st.rerun()  # Force immediate refresh
     else:
-        st.warning("Models directory not found")
+        st.info("No documents found. Upload a document first.")
+    st.header("🤖 Model")
+    
+    model_dir = Path("models")
+    if model_dir.exists():
+        model_files = list(model_dir.glob("boundary_model*.pkl"))
+        if model_files:
+            model_options = ["None"] + [f.name for f in model_files]
+            selected_model = st.selectbox("Select Model", model_options)
+            
+            if selected_model != "None" and selected_model != st.session_state.model_name:
+                if st.button("Load Model"):
+                    load_model(model_dir / selected_model)
+        else:
+            st.info("No models found in /models")
+    
+    if st.session_state.model:
+        st.success(f"✅ {st.session_state.model_name}")
+        
+        # Prediction controls
+        st.subheader("Predictions")
+        if st.button("🔮 Predict Current Page"):
+            apply_model_predictions(page_only=True)
+        
+        if st.button("🔮 Predict All Pages"):
+            apply_model_predictions(page_only=False)
+        
+        # Boundary threshold
+        st.session_state.boundary_threshold = st.slider(
+            "Boundary Threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=st.session_state.get('boundary_threshold', 0.5),
+            step=0.05,
+            help="Probability threshold for new unit boundaries"
+        )
+        
+        if st.button("🤖 Auto-Label Remaining"):
+            auto_label_remaining()
+        
+        if st.button("🎯 Next Uncertain"):
+            next_uncertain()
+    
+    st.divider()
+    
+    # Display options
+    st.header("Display Options")
+    show_unit_numbers = st.checkbox(
+        "Show Unit Numbers", 
+        value=True,
+        help="Display semantic unit numbers as small blue boxes"
+    )
+    show_heatmap = st.checkbox(
+        "Show Prediction Heatmap",
+        value=bool(st.session_state.get('predictions')),
+        help="Show model prediction confidence colors"
+    )
+def label_digits_as_units():
+    """Label spans containing numeric values as individual units on current page (rule-based feature)"""
+    import re
+    
+    spans = AppState.get_current_spans()
+    if not spans:
+        return
+    
+    # Get current page number
+    current_page = st.session_state.current_page
+    
+    # Filter spans to current page only
+    page_spans = [s for s in spans if s.page_number == current_page]
+    
+    if not page_spans:
+        st.info("No spans on current page!")
+        return
+    
+    # Comprehensive numeric patterns
+    numeric_patterns = [
+        r'^-?\d+$',                                    # Simple integers (123, -456)
+        r'^-?\d+[.,]\d+$',                            # Decimals with . or , (4.93, 4,98)
+        r'^-?\d{1,3}([\s,]\d{3})*([.,]\d+)?$',       # Thousands with comma (1,234.56)
+        r'^-?\d{1,3}([\s.]\d{3})*(,\d+)?$',          # European thousands (1.234,56)
+        r'^-?\d+([.,]\d+)?%$',                        # Percentages (45.3%, 45,3%)
+        r'^-?\$?\d+([.,]\d{2})?$',                   # Currency amounts ($4.99, 4.99)
+        r'^-?€?\d+([.,]\d{2})?$',                    # Euro amounts (€4,99)
+        r'^-?£?\d+([.,]\d{2})?$',                    # Pound amounts (£4.99)
+        r'^\d+[/-]\d+[/-]\d+$',                      # Dates (12/31/2024, 31-12-2024)
+        r'^\d{1,2}:\d{2}(:\d{2})?$',                 # Times (12:45, 12:45:30)
+        r'^\(\d+\)$',                                # Numbers in parentheses ((123))
+        r'^\[\d+\]$',                                # Numbers in brackets ([123])
+        r'^#\d+$',                                   # Issue/ticket numbers (#123)
+        r'^\d+\.$',                                  # Numbers ending with period (list items: 1.)
+        r'^-?\d+([.,]\d+)?\s*(k|K|m|M|b|B)$',       # Abbreviated numbers (1.5k, 2M)
+    ]
+    
+    # Find unlabeled spans on current page that match numeric patterns
+    digit_spans = []
+    for span in page_spans:
+        key = (span.page_number, span.span_id)
+        if key not in st.session_state.labels:
+            cleaned_text = span.text.strip()
+            if cleaned_text:
+                # Check if text matches any numeric pattern
+                is_numeric = any(re.match(pattern, cleaned_text) for pattern in numeric_patterns)
+                
+                # Also check for simple numeric strings that might have spaces
+                # (like page numbers "1 2 3" or ranges "1 - 5")
+                if not is_numeric:
+                    # Remove spaces and check if it's mostly digits
+                    no_space = cleaned_text.replace(' ', '').replace('-', '').replace('–', '')
+                    if no_space and re.match(r'^\d+$', no_space) and len(no_space) <= 10:
+                        is_numeric = True
+                
+                if is_numeric:
+                    digit_spans.append(span)
+    
+    if not digit_spans:
+        st.info("No unlabeled numeric spans found on this page!")
+        return
+    
+    # Create individual units for numeric spans
+    labels_to_add = {}
+    for span in digit_spans:
+        key = (span.page_number, span.span_id)
+        
+        # Each numeric span gets its own unit
+        st.session_state.unit_counter += 1
+        unit_id = f"unit_{st.session_state.unit_counter}"
+        
+        label = Label(
+            span_id=span.span_id,
+            page_number=span.page_number,
+            boundary="new",  # Each is a new unit
+            unit_id=unit_id,
+            confidence=1.0
+        )
+        labels_to_add[key] = label
+    
+    # Add to undo stack following state management pattern
+    AppState.add_to_undo_stack({
+        'labels_added': labels_to_add
+    })
+    
+    # Update labels
+    st.session_state.labels.update(labels_to_add)
+    
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
+    
+    # Show what types of numbers were found (for debugging/verification)
+    sample_numbers = [s.text.strip() for s in digit_spans[:5]]  # Show first 5 examples
+    examples = ", ".join(sample_numbers) if sample_numbers else ""
+    
+    if examples:
+        st.success(f"Labeled {len(labels_to_add)} numeric spans on page {current_page}. Examples: {examples}")
+    else:
+        st.success(f"Labeled {len(labels_to_add)} numeric spans on page {current_page}")
+
+
+def label_rest_as_single_units():
+    """Label all remaining unlabeled spans as individual units on current page"""
+    spans = AppState.get_current_spans()
+    if not spans:
+        return
+    
+    # Get current page number
+    current_page = st.session_state.current_page
+    
+    # Filter spans to current page only
+    page_spans = [s for s in spans if s.page_number == current_page]
+    
+    if not page_spans:
+        st.info("No spans on current page!")
+        return
+    
+    # Find unlabeled spans on current page
+    unlabeled_spans = []
+    for span in page_spans:
+        key = (span.page_number, span.span_id)
+        if key not in st.session_state.labels:
+            unlabeled_spans.append(span)
+    
+    if not unlabeled_spans:
+        st.info("All spans on this page already labeled!")
+        return
+    
+    # Create individual units for each unlabeled span
+    labels_to_add = {}
+    for span in unlabeled_spans:
+        key = (span.page_number, span.span_id)
+        
+        # Each span gets its own unit
+        st.session_state.unit_counter += 1
+        unit_id = f"unit_{st.session_state.unit_counter}"
+        
+        label = Label(
+            span_id=span.span_id,
+            page_number=span.page_number,
+            boundary="new",  # Each is a new unit
+            unit_id=unit_id,
+            confidence=1.0
+        )
+        labels_to_add[key] = label
+    
+    # Add to undo stack following state management pattern
+    AppState.add_to_undo_stack({
+        'labels_added': labels_to_add
+    })
+    
+    # Update labels
+    st.session_state.labels.update(labels_to_add)
+    
+    # Save labels
+    save_labels(st.session_state.current_doc, st.session_state.labels)
+    
+    st.success(f"Labeled {len(labels_to_add)} spans as individual units on page {current_page}")
 
 # Toolbar
 st.markdown("### 🎯 Labeling Workflow")
@@ -631,253 +597,182 @@ st.info("**Select spans** that belong together → **Merge** them → **Auto-lab
 c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 
 with c1:
-    if st.button("🔗 **Merge Selected**", 
-                 help="Merge selected spans into one unit — or create a unit if only one is selected (M)", 
-                 use_container_width=True, 
-                 type="primary", 
-                 key="merge_button"):
+    if st.button("🔗 Merge Selected", help="Merge selected spans into unit"):
         merge_selected_spans()
 
-    # Add a hidden attribute so our JS knows which button to trigger
-    st.markdown(
-        """
-        <script>
-        // Add a marker attribute to the merge button
-        const mergeBtn = window.parent.document.querySelector('button[kind][data-testid="stButton"][aria-label="🔗 **Merge Selected**"]');
-        if (mergeBtn && !mergeBtn.hasAttribute("data-merge-key")) {
-            mergeBtn.setAttribute("data-merge-key", "true");
-        }
-        </script>
-        """,
-        unsafe_allow_html=True
-    )
-
-
 with c2:
-    if st.button("🤖 Auto-Label Rest", help="Label all remaining spans as individual units", 
-                use_container_width=True):
-        auto_label_remaining()
-
-with c3:
-    if st.button("✂️ Split Unit", help="Split unit at selected span (S)", use_container_width=True):
+    if st.button("✂️ Split Selected", help="Split each selected span into separate units"):
         split_unit()
 
-with c4:
-    if st.button("🗑️ Clear Page", help="Clear all labels on this page", use_container_width=True):
+with c3:
+    if st.button("🗑️ Clear Page", help="Clear all labels on current page"):
         clear_page_labels()
 
-with c5:
-    if st.button("↩️ Undo", help="Undo last action (Ctrl+Z)", use_container_width=True):
-        if undo_action():
-            st.rerun()
+with c4:
+    if st.button("↩️ Undo", help="Undo last action"):
+        undo_action()
 
-with c6:
-    if st.button("💾 Save", help="Save labels", use_container_width=True):
+with c5:
+    if st.button("💾 Save", help="Save labels to disk"):
         save_current_labels()
 
+with c6:
+    if st.button("🔄 Refresh", help="Reload spans and labels"):
+        AppState.refresh_data()
+
 with c7:
-    if st.button("🔢 DigitSU", help="Put every digit-containing span on this page into its own semantic unit",
-                 use_container_width=True):
-        enforce_digit_units()
+    st.metric("Units", len(set(l.unit_id for l in st.session_state.labels.values())))
 
-# Confidence slider
-if st.session_state.confidence_mode:
-    st.session_state.confidence_level = st.slider(
-        "Confidence for manual merges", 1, 5, 3,
-        help="Confidence level for manually merged units (auto-labels get confidence=1)"
-    )
+# Add rule-based labeling buttons below
+st.markdown("#### 🤖 Rule-Based Labeling")
+rc1, rc2 = st.columns(2)
 
+with rc1:
+    if st.button("🔢 Label Digits", help="Label spans containing only digits as units"):
+        label_digits_as_units()
+
+with rc2:
+    if st.button("📝 Label Remaining", help="Label all remaining unlabeled spans as individual units"):
+        label_rest_as_single_units()
 # Main content
 if st.session_state.current_doc:
-    spans = load_spans(st.session_state.current_doc)
-    page_spans = [s for s in spans if s.page_number == st.session_state.current_page]
-    
-    # Load existing labels once
-    if not st.session_state.labels:
-        for label in load_labels(st.session_state.current_doc):
-            key = (label.page_number, label.span_id)
-            st.session_state.labels[key] = label
-            unit_num = int(label.unit_id.split('_')[1]) if '_' in label.unit_id else 0
-            st.session_state.unit_counter = max(st.session_state.unit_counter, unit_num)
-    
-    # --- Page Navigation (Prev / Next / Jump) ---
-    total_pages = max((s.page_number for s in spans), default=1)
-    
-    nav_l, nav_c, nav_r = st.columns([1, 2, 1])
-    
-    with nav_l:
-        disabled_prev = st.session_state.current_page <= 1
-        if st.button("⬅️ Previous", use_container_width=True, disabled=disabled_prev):
-            AppState.set_page(max(1, st.session_state.current_page - 1))
-            st.rerun()
-    
-    with nav_c:
-        new_page = st.number_input(
-            "Page", min_value=1, max_value=total_pages,
-            value=int(st.session_state.current_page), step=1
-        )
-        if int(new_page) != st.session_state.current_page:
-            AppState.set_page(int(new_page))
-            st.rerun()
-        st.caption(f"of {total_pages} pages")
-    
-    with nav_r:
-        disabled_next = st.session_state.current_page >= total_pages
-        if st.button("Next ➡️", use_container_width=True, disabled=disabled_next):
-            AppState.set_page(min(total_pages, st.session_state.current_page + 1))
-            st.rerun()
-    
+    spans = AppState.get_current_spans()
     pdf_path = Path("data/docs") / st.session_state.current_doc / "document.pdf"
     
-    # Stats
-    labeled_spans = sum(1 for s in page_spans if (st.session_state.current_page, s.span_id) in st.session_state.labels)
-    total_spans = len(page_spans)
-    
-    m1, m2, m3 = st.columns([2, 1, 1])
-    with m1:
-        st.progress(labeled_spans / total_spans if total_spans > 0 else 0,
-                   text=f"Page Progress: {labeled_spans}/{total_spans} spans labeled")
-    with m2:
-        unique_units = len(set(l.unit_id for l in st.session_state.labels.values() 
-                             if l.page_number == st.session_state.current_page))
-        st.metric("Units on page", unique_units)
-    with m3:
-        st.metric("Selected", len(st.session_state.selected_spans))
-    
-    # === Side-by-side: left overlay preview, right span selector ===
-    left, right = st.columns([3, 2], gap="large")
-    
-    with left:
-        st.subheader("Document Preview (Overlay)")
+    if spans and pdf_path.exists():
+        # Page navigation
+        max_pages = max(s.page_number for s in spans) if spans else 1
         
-        if pdf_path.exists() and page_spans:
-            zoom = st.session_state.zoom_level / 100.0
+        # Use callback for instant page change
+        def on_page_change():
+            st.session_state.selected_spans = []  # Clear selection on page change
+        
+        new_page = st.number_input(
+            "Page", 
+            min_value=1, 
+            max_value=max_pages, 
+            value=st.session_state.get('current_page', 1),
+            key="page_input"
+        )
+        
+        if new_page != st.session_state.get('current_page', 1):
+            st.session_state.current_page = new_page
+            st.session_state.selected_spans = []  # Clear selection on page change
+            st.rerun()  # Force refresh for instant page change
+        
+        # Filter spans for current page
+        page_spans = [s for s in spans if s.page_number == st.session_state.current_page]
+        
+        # Main layout
+        left, right = st.columns([3, 2])
+        
+        with left:
+            st.subheader("Document Preview (Overlay)")
+            
+            zoom = st.session_state.get('zoom_level', 100) / 100.0
             pdf_bytes = render_pdf_page(pdf_path, st.session_state.current_page, zoom)
             base_img = Image.open(io.BytesIO(pdf_bytes))
+            
+            # Get predictions for current page
+            page_predictions = None
+            if st.session_state.get('predictions'):
+                page_predictions = {
+                    k: v for k, v in st.session_state.predictions.items() 
+                    if k[0] == st.session_state.current_page
+                }
             
             overlay_img = draw_overlay(
                 base_img,
                 page_spans,
                 st.session_state.labels,
                 st.session_state.selected_spans,
-                predictions=st.session_state.predictions,
-                show_heatmap=bool(st.session_state.predictions),
-                zoom=1.0  # already zoomed
+                predictions=page_predictions,
+                show_heatmap=show_heatmap,
+                show_unit_numbers=show_unit_numbers,
+                zoom=zoom
             )
             
             st.image(overlay_img, use_container_width=True)
-            st.caption("💡 Select spans on the right, then use Merge / Split.")
-        elif not pdf_path.exists():
-            st.warning("PDF file not found. Please re-upload the document.")
-        else:
-            st.info("No spans detected on this page.")
-    
-    with right:
-        st.subheader("Span Selector & Units")
-        
-        if page_spans:
-            # Group spans by lines (approximate) for layout
-            lines = {}
-            for span in page_spans:
-                line_key = round(span.y_bottom / 15) * 15
-                lines.setdefault(line_key, []).append(span)
             
-            for _, line_spans in sorted(lines.items()):
-                line_spans.sort(key=lambda s: s.x_center)
-                cols = st.columns(len(line_spans)) if line_spans else []
-                
-                for i, span in enumerate(line_spans):
-                    with cols[i]:
-                        is_selected = span.span_id in st.session_state.selected_spans
-                        key = (st.session_state.current_page, span.span_id)
-                        label = st.session_state.labels.get(key)
-                        
-                        txt = span.text[:15] + "..." if len(span.text) > 15 else span.text
-                        if label and label.boundary == "new":
-                            txt = f"[{label.unit_id}] {txt}"
-                        
-                        if st.button(
-                            txt,
-                            key=f"span_{span.span_id}",
-                            type="primary" if is_selected else "secondary",
-                            help=f"ID: {span.span_id}\nUnit: {label.unit_id if label else 'None'}\nText: {span.text}",
-                            use_container_width=True
-                        ):
-                            AppState.toggle_span_selection(span.span_id)
-                            st.rerun()
-            
-            # Quick actions for current selection
-            if st.session_state.selected_spans:
-                st.divider()
-                qa1, qa2, qa3 = st.columns(3)
-                with qa1:
-                    if st.button("Clear Selection", use_container_width=True):
-                        st.session_state.selected_spans = []
-                        st.rerun()
-                with qa2:
-                    if st.button("Select All", use_container_width=True):
-                        st.session_state.selected_spans = [s.span_id for s in page_spans]
-                        st.rerun()
-                with qa3:
-                    if st.button("Invert Selection", use_container_width=True):
-                        current = set(st.session_state.selected_spans)
-                        all_spans = set(s.span_id for s in page_spans)
-                        st.session_state.selected_spans = list(all_spans - current)
-                        st.rerun()
-        
-        # Feature panel
-        if st.session_state.show_features and st.session_state.selected_spans:
-            st.divider()
-            st.subheader("Feature Details")
-            show_feature_panel(
-                st.session_state.selected_spans,
-                page_spans,
-                show_normalized=True,
-                show_rules=st.session_state.show_rules
+            # Zoom control with instant feedback
+            new_zoom = st.slider(
+                "Zoom", 
+                min_value=50, 
+                max_value=200, 
+                value=st.session_state.get('zoom_level', 100),
+                step=10,
+                key="zoom_slider"
             )
-    
-    # Inference controls (only show if model loaded but not applied yet)
-    if st.session_state.model:
-        st.divider()
-        st.subheader("🔮 Model Inference")
-        
-        i1, i2, i3 = st.columns(3)
-        with i1:
-            if st.button("Run Inference - Page", use_container_width=True):
-                with st.spinner("Running inference..."):
-                    rows, span_pairs = [], []
-                    sorted_spans = sorted(page_spans, key=lambda s: s.reading_order)
+            
+            if new_zoom != st.session_state.get('zoom_level', 100):
+                st.session_state.zoom_level = new_zoom
+                st.rerun()  # Force refresh for instant zoom
+        # Replace the span selection section in 01_Label.py (starting from line ~437)
+
+        with right:
+            # Span selection interface with instant feedback
+            st.subheader("🔍 Span Selection")
+            
+            if page_spans:
+                # Use enumerate to ensure unique indices
+                for i, span in enumerate(page_spans):
+                    key = (span.page_number, span.span_id)
+                    is_selected = span.span_id in st.session_state.selected_spans
+                    is_labeled = key in st.session_state.labels
                     
-                    for i in range(1, len(sorted_spans)):
-                        features = compute_features_for_model(sorted_spans[i-1], sorted_spans[i])
-                        rows.append(features)
-                        span_pairs.append((sorted_spans[i-1].span_id, sorted_spans[i].span_id))
-                    
-                    if rows:
-                        df = pd.DataFrame(rows)
-                        try:
-                            if hasattr(st.session_state.model, 'predict_proba'):
-                                probs = st.session_state.model.predict_proba(df)[:, 1]
+                    # Use form for instant feedback
+                    with st.container():
+                        col1, col2 = st.columns([1, 4])
+                        
+                        with col1:
+                            # Use button with unique key including index
+                            button_label = "☑️" if is_selected else "⬜"
+                            # Include index i to ensure uniqueness even if span_ids repeat
+                            if st.button(
+                                button_label, 
+                                key=f"toggle_{span.page_number}_{span.span_id}_{i}",  # More unique key
+                                help=f"Toggle selection of {span.span_id}"
+                            ):
+                                toggle_span_selection(span.span_id)
+                                st.rerun()  # Force instant overlay refresh
+                        
+                        with col2:
+                            # Show span text preview
+                            text_preview = span.text[:60] + "..." if len(span.text) > 60 else span.text
+                            
+                            # Color coding based on state
+                            if is_labeled:
+                                label = st.session_state.labels[key]
+                                boundary_icon = "🆕" if label.boundary == "new" else "➡️"
+                                st.markdown(f"{boundary_icon} `{span.span_id}` - {text_preview}")
+                                st.caption(f"Unit: {label.unit_id}")
                             else:
-                                probs = st.session_state.model.predict(df)
-                            st.session_state.predictions = dict(zip(span_pairs, probs))
-                            st.success(f"Analyzed {len(probs)} potential boundaries")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Inference failed: {str(e)}")
-                            st.write("Features in data:", df.columns.tolist())
-                            if hasattr(st.session_state.model, 'feature_names_in_'):
-                                st.write("Features expected by model:", st.session_state.model.feature_names_in_.tolist())
-        
-        with i2:
-            if st.button("Find Uncertain", use_container_width=True):
-                next_uncertain()
-        
-        with i3:
-            if st.button("Clear Predictions", use_container_width=True):
-                st.session_state.predictions = {}
-                st.rerun()
+                                color = "🔵" if is_selected else "⚪"
+                                st.markdown(f"{color} `{span.span_id}` - {text_preview}")
+                            
+                            # Show prediction if available
+                            if st.session_state.get('predictions') and key in st.session_state.predictions:
+                                prob = st.session_state.predictions[key]
+                                st.caption(f"🎯 Boundary prob: {prob:.3f}")
+            else:
+                st.info("No spans found on this page")
+            
+            # Feature panel
+            show_feature_panel(page_spans, st.session_state.labels, st.session_state.selected_spans)
+
+    else:
+        st.warning("No document loaded or PDF not found")
+        if st.button("🔄 Try to Load Document"):
+            AppState.refresh_data()
+            st.rerun()
 else:
-    st.warning("Please select a document from the main page or upload a new PDF")
-    if st.button("📄 Upload New PDF", type="primary"):
-        st.switch_page("pages/00_Upload.py")
+    st.info("Please upload a document first using the Upload page")
+    if st.button("🔄 Check for New Documents"):
+        # Try to auto-load if documents are available
+        data_dir = Path("data/docs")
+        if data_dir.exists():
+            doc_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+            if doc_dirs:
+                latest_doc = max(doc_dirs, key=lambda d: d.stat().st_mtime)
+                AppState.load_document_data(latest_doc.name)
+                st.rerun()

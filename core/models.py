@@ -1,293 +1,328 @@
-# boundary_model.py
-import json
-import time
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
-from dataclasses import dataclass, field
 import joblib
-import numpy as np
 import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import precision_recall_curve, f1_score
-from sklearn.inspection import permutation_importance
-
-MODEL_VERSION = "1.2.0"
-
-
-DEFAULT_FEATURES = [
-    # geometry & spacing
-    "x_offset_norm", "y_gap_norm", "center_dist_norm", "vertical_overlap",
-    "indent_diff_norm", "right_edge_diff_norm",
-    # typography
-    "font_size_diff_norm", "line_height_diff_norm",
-    "same_font_size", "same_line_height",
-    # style/layout
-    "same_column", "same_bold", "same_italic",
-    # ordering
-    "reading_order_gap",
-    # text cues
-    "prev_ends_with_newline", "prev_ends_with_hyphen", "prev_ends_with_colon",
-    "prev_ends_with_period", "prev_ends_with_comma",
-    "curr_starts_lower", "curr_starts_upper",
-    # (optionally present raw helpers)
-    "prev_height", "curr_height", "prev_width", "curr_width",
-    # rule features (if present)
-    "prev_is_header", "curr_is_header",
-    "prev_is_caption", "curr_is_caption",
-    "prev_is_page_num", "curr_is_page_num",
-    "prev_is_list_bullet", "curr_is_list_bullet",
-    "prev_is_list_number", "curr_is_list_number",
-    "prev_is_footnote", "curr_is_footnote",
-    "prev_header_level", "curr_header_level",
-    "same_rule_class",
-]
-
-IDENT_COLS = {
-    "doc_id", "page", "span_id_prev", "span_id_curr",
-    "reading_order_prev", "reading_order_curr"
-}
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import json
 
 class BoundaryModel:
-    """Boundary predictor with calibrated probabilities and robust feature handling."""
-
-    def __init__(self, model_path: Optional[Path] = None):
-        self.model = None                     # may be RF or CalibratedClassifierCV
-        self.base_model = None                # uncalibrated RF (for importances)
-        self.feature_columns: List[str] = []  # in-order training features
-        self.threshold_: float = 0.5          # decision threshold on P(boundary=new)
-        self.metadata: Dict = {}              # saved extra info
-
-        if model_path and Path(model_path).exists():
-            self.load(model_path)
-
-    # --------- persistence ---------
-    def load(self, model_path: Path):
-        data = joblib.load(model_path)
-        self.model = data["model"]
-        self.base_model = data.get("base_model")
-        self.feature_columns = data["feature_columns"]
-        self.threshold_ = data.get("threshold_", 0.5)
-        self.metadata = data.get("metadata", {})
-
-    def save(self, model_path: Path):
-        payload = {
-            "model": self.model,
-            "base_model": self.base_model,
-            "feature_columns": self.feature_columns,
-            "threshold_": self.threshold_,
-            "metadata": {
-                **self.metadata,
-                "version": MODEL_VERSION,
-                "saved_at": int(time.time()),
-            },
-        }
-        joblib.dump(payload, model_path)
-
-    # --------- training ---------
-    def _resolve_features(self, df: pd.DataFrame, feature_columns: Optional[List[str]]) -> List[str]:
-        if feature_columns is None:
-            # prefer DEFAULT_FEATURES but only those present; if empty, fallback to all numeric except identifiers/target
-            cols = [c for c in DEFAULT_FEATURES if c in df.columns]
-            if not cols:
-                cols = [c for c in df.select_dtypes(include=[np.number]).columns
-                        if c not in IDENT_COLS and c != "y_boundary"]
-            return cols
-        # keep order given by user but only those present
-        return [c for c in feature_columns if c in df.columns]
-
-    def _prepare_matrix(
-        self, df: pd.DataFrame, feature_columns: List[str]
-    ) -> np.ndarray:
-        # add any missing expected columns as zeros (robust to schema drift)
-        missing = [c for c in feature_columns if c not in df.columns]
-        if missing:
-            for c in missing:
-                df[c] = 0.0
-        # ensure order
-        X = df[feature_columns].astype(float).values
-        return X
-
-    def train(
-        self,
-        df: pd.DataFrame,
-        feature_columns: Optional[List[str]] = None,
-        *,
-        calibrate: bool = True,
-        calibration_cv: int = 3,
-        class_weight: str = "balanced_subsample",
-        rf_params: Optional[Dict] = None,
-        set_threshold_by: Optional[str] = None,  # "f1", "best_f1", "target_recall:0.90", "target_precision:0.90"
-    ):
+    """
+    Boundary detection model using sliding window features.
+    
+    Replaces the old pairwise approach with richer contextual features.
+    """
+    
+    def __init__(self, 
+                 n_estimators: int = 100,
+                 max_depth: Optional[int] = None,
+                 random_state: int = 42,
+                 calibrate: bool = True):
+        
+        self.base_model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            class_weight='balanced'  # Handle imbalanced boundaries
+        )
+        self.calibrate = calibrate
+        self.model = None
+        self.feature_names_ = None
+        self.feature_names_in_ = None  # Added for sklearn compatibility
+        self.threshold_ = 0.5
+        self.metadata_ = {}
+        
+    def train(self, 
+              train_df: pd.DataFrame, 
+              test_df: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         """
-        Train a RandomForest on features -> y_boundary, optionally calibrate probabilities and set decision threshold.
+        Train boundary detection model using sliding window features.
+        
+        Args:
+            train_df: Training data with sliding window features
+            test_df: Optional test data for evaluation
+            
+        Returns:
+            Training metrics and feature importance
         """
-        if "y_boundary" not in df.columns:
-            raise ValueError("Training DataFrame must contain 'y_boundary' column.")
-
-        self.feature_columns = self._resolve_features(df, feature_columns)
-        if not self.feature_columns:
-            raise ValueError("No usable feature columns found.")
-
-        X = self._prepare_matrix(df.copy(), self.feature_columns)
-        y = df["y_boundary"].astype(int).values
-
-        params = {
-            "n_estimators": 400,
-            "max_depth": None,
-            "min_samples_split": 2,
-            "min_samples_leaf": 1,
-            "random_state": 42,
-            "n_jobs": -1,
-            "class_weight": class_weight,
-        }
-        if rf_params:
-            params.update(rf_params)
-
-        rf = RandomForestClassifier(**params)
-        rf.fit(X, y)
-        self.base_model = rf
-
-        if calibrate:
-            # Calibrate on the training data via CV; for production you might want a held-out set
-            cal = CalibratedClassifierCV(rf, method="isotonic", cv=calibration_cv)
-            cal.fit(X, y)
-            self.model = cal
+        
+        # Separate features from metadata and target
+        metadata_cols = ['doc_id', 'page', 'span_id', 'y_boundary']
+        feature_cols = [c for c in train_df.columns if c not in metadata_cols]
+        
+        X_train = train_df[feature_cols].fillna(0)  # Handle any missing values
+        y_train = train_df['y_boundary']
+        
+        print(f"🏋️  Training on {len(X_train)} examples with {len(feature_cols)} features")
+        print(f"   📊 Class distribution: {y_train.value_counts().to_dict()}")
+        
+        # Store feature names for consistency
+        self.feature_names_ = feature_cols
+        self.feature_names_in_ = np.array(feature_cols)  # Store as numpy array for sklearn compatibility
+        
+        # Train model (with optional calibration)
+        if self.calibrate:
+            self.model = CalibratedClassifierCV(self.base_model, cv=3)
         else:
-            self.model = rf
-
-        # optional threshold selection
-        if set_threshold_by:
-            probs = self.predict_proba(df)
-            self.threshold_ = self._choose_threshold(y, probs, set_threshold_by)
-
-        # store helpful metadata
-        self.metadata = {
-            "rf_params": params,
-            "calibrated": calibrate,
-            "calibration_cv": calibration_cv if calibrate else None,
-            "feature_count": len(self.feature_columns),
-            "features": list(self.feature_columns),
+            self.model = self.base_model
+            
+        self.model.fit(X_train, y_train)
+        
+        # For calibrated models, extract base estimator feature importance
+        if self.calibrate and hasattr(self.model, 'calibrated_classifiers_'):
+            # Store feature names in base estimator for consistency
+            for clf in self.model.calibrated_classifiers_:
+                if hasattr(clf, 'base_estimator'):
+                    clf.base_estimator.feature_names_in_ = self.feature_names_in_
+        
+        # Evaluate on training set
+        train_pred = self.model.predict(X_train)
+        train_prob = self.model.predict_proba(X_train)[:, 1]
+        
+        train_metrics = {
+            'accuracy': (train_pred == y_train).mean(),
+            'auc_roc': roc_auc_score(y_train, train_prob),
+            'n_samples': len(y_train),
+            'n_features': len(feature_cols),
+            'pos_rate': y_train.mean()
         }
-
-    # --------- inference ---------
-    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        
+        # Evaluate on test set if provided
+        test_metrics = {}
+        if test_df is not None and len(test_df) > 0:
+            X_test = test_df[feature_cols].fillna(0)
+            y_test = test_df['y_boundary']
+            
+            test_pred = self.model.predict(X_test)
+            test_prob = self.model.predict_proba(X_test)[:, 1]
+            
+            test_metrics = {
+                'accuracy': (test_pred == y_test).mean(),
+                'auc_roc': roc_auc_score(y_test, test_prob),
+                'n_samples': len(y_test),
+                'pos_rate': y_test.mean()
+            }
+            
+            print(f"🧪 Test AUC: {test_metrics['auc_roc']:.3f}")
+        
+        # Feature importance
+        if hasattr(self.model, 'feature_importances_'):
+            importances = self.model.feature_importances_
+        elif self.calibrate and hasattr(self.model, 'calibrated_classifiers_'):
+            # Get average importance from calibrated classifiers
+            importances_list = []
+            for clf in self.model.calibrated_classifiers_:
+                if hasattr(clf.base_estimator, 'feature_importances_'):
+                    importances_list.append(clf.base_estimator.feature_importances_)
+            if importances_list:
+                importances = np.mean(importances_list, axis=0)
+            else:
+                importances = np.zeros(len(feature_cols))
+        else:
+            importances = np.zeros(len(feature_cols))
+        
+        feature_importance = list(zip(feature_cols, importances))
+        feature_importance.sort(key=lambda x: x[1], reverse=True)
+        
+        # Store metadata
+        self.metadata_ = {
+            'train_metrics': train_metrics,
+            'test_metrics': test_metrics,
+            'feature_importance': feature_importance[:20],  # Top 20 features
+            'model_type': 'RandomForest + Calibration' if self.calibrate else 'RandomForest',
+            'feature_count': len(feature_cols)
+        }
+        
+        print(f"✅ Training complete. Train AUC: {train_metrics['auc_roc']:.3f}")
+        
+        return self.metadata_
+    
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Predict boundary probabilities"""
         if self.model is None:
-            raise ValueError("Model not loaded or trained.")
-        X = self._prepare_matrix(df.copy(), self.feature_columns)
-        # proba for class 1 (boundary=new)
-        return self.model.predict_proba(X)[:, 1]
-
-    def predict(self, df: pd.DataFrame, threshold: Optional[float] = None) -> np.ndarray:
-        thr = self.threshold_ if threshold is None else float(threshold)
-        p = self.predict_proba(df)
-        return (p >= thr).astype(int)
-
-    # --------- utilities ---------
-    def _choose_threshold(self, y_true: np.ndarray, y_proba: np.ndarray, strategy: str) -> float:
+            raise ValueError("Model not trained. Call train() first.")
+        
+        # Ensure feature order matches training
+        if hasattr(X, 'columns'):  # DataFrame
+            X = X[self.feature_names_].fillna(0)
+        elif isinstance(X, list) and len(X) > 0 and isinstance(X[0], dict):
+            # List of dictionaries
+            df = pd.DataFrame(X)
+            # Add missing columns with default value 0
+            for col in self.feature_names_:
+                if col not in df.columns:
+                    df[col] = 0
+            X = df[self.feature_names_].fillna(0)
+        
+        return self.model.predict_proba(X)
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Predict boundaries using threshold"""
+        proba = self.predict_proba(X)
+        return (proba[:, 1] >= self.threshold_).astype(int)
+    
+    def save(self, model_path: Path) -> None:
+        """Save model and metadata"""
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save model
+        joblib.dump(self, model_path)
+        
+        # Save metadata separately for easy inspection
+        metadata_path = model_path.with_suffix('.json')
+        with open(metadata_path, 'w') as f:
+            json.dump(self.metadata_, f, indent=2, default=str)
+        
+        print(f"💾 Model saved: {model_path}")
+        print(f"📋 Metadata saved: {metadata_path}")
+    
+    @classmethod
+    def load(cls, model_path: Path) -> 'BoundaryModel':
+        """Load trained model"""
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
+        
+        model = joblib.load(model_path)
+        
+        # Load metadata if available
+        metadata_path = model_path.with_suffix('.json')
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                model.metadata_ = json.load(f)
+        
+        print(f"📂 Model loaded: {model_path}")
+        return model
+    
+    def get_feature_importance(self, top_k: int = 20) -> List[Tuple[str, float]]:
+        """Get top feature importances"""
+        if not self.metadata_ or 'feature_importance' not in self.metadata_:
+            return []
+        
+        return self.metadata_['feature_importance'][:top_k]
+    
+    def tune_threshold(self, 
+                      X_val: pd.DataFrame, 
+                      y_val: pd.Series,
+                      metric: str = 'f1') -> float:
         """
-        strategy:
-          - "f1" or "best_f1": threshold maximizing F1
-          - "target_recall:0.90": smallest threshold with recall >= 0.90
-          - "target_precision:0.90": smallest threshold with precision >= 0.90
+        Tune decision threshold on validation set.
+        
+        Args:
+            X_val: Validation features
+            y_val: Validation labels  
+            metric: Metric to optimize ('f1', 'precision', 'recall')
+            
+        Returns:
+            Optimal threshold
         """
-        strategy = strategy.lower()
-        prec, rec, thr = precision_recall_curve(y_true, y_proba)
-        thr = np.append(thr, 1.0)  # align lengths with (prec, rec)
+        from sklearn.metrics import precision_recall_curve, f1_score
+        
+        # Get prediction probabilities
+        proba = self.predict_proba(X_val[self.feature_names_])[:, 1]
+        
+        # Try different thresholds
+        thresholds = np.arange(0.1, 0.9, 0.05)
+        scores = []
+        
+        for thresh in thresholds:
+            y_pred = (proba >= thresh).astype(int)
+            
+            if metric == 'f1':
+                score = f1_score(y_val, y_pred)
+            elif metric == 'precision':
+                from sklearn.metrics import precision_score
+                score = precision_score(y_val, y_pred, zero_division=0)
+            elif metric == 'recall':
+                from sklearn.metrics import recall_score
+                score = recall_score(y_val, y_pred)
+            else:
+                raise ValueError(f"Unknown metric: {metric}")
+                
+            scores.append(score)
+        
+        # Find optimal threshold
+        best_idx = np.argmax(scores)
+        optimal_threshold = thresholds[best_idx]
+        best_score = scores[best_idx]
+        
+        self.threshold_ = optimal_threshold
+        
+        print(f"🎯 Optimal threshold: {optimal_threshold:.3f} ({metric}: {best_score:.3f})")
+        
+        return optimal_threshold
 
-        if strategy in {"f1", "best_f1"}:
-            f1s = 2 * (prec * rec) / np.clip(prec + rec, 1e-9, None)
-            best_idx = int(np.nanargmax(f1s))
-            return float(thr[best_idx])
+def train_boundary_model(train_path: Path, 
+                        test_path: Optional[Path] = None,
+                        model_dir: Path = Path("models")) -> BoundaryModel:
+    """
+    Train a boundary detection model from exported data.
+    
+    Args:
+        train_path: Path to training parquet file
+        test_path: Optional path to test parquet file
+        model_dir: Directory to save model
+        
+    Returns:
+        Trained model
+    """
+    
+    # Load data
+    print(f"📂 Loading training data from {train_path}")
+    train_df = pd.read_parquet(train_path)
+    
+    test_df = None
+    if test_path and test_path.exists():
+        print(f"📂 Loading test data from {test_path}")
+        test_df = pd.read_parquet(test_path)
+    
+    # Initialize and train model
+    model = BoundaryModel(
+        n_estimators=200,
+        max_depth=20,
+        random_state=42,
+        calibrate=True
+    )
+    
+    # Train model
+    metrics = model.train(train_df, test_df)
+    
+    # Save model
+    model_path = model_dir / "boundary_model.pkl"
+    model.save(model_path)
+    
+    return model
 
-        if strategy.startswith("target_recall:"):
-            target = float(strategy.split(":")[1])
-            # choose lowest threshold that achieves target recall
-            idx = np.where(rec >= target)[0]
-            return float(thr[idx[0]]) if len(idx) else 1.0
-
-        if strategy.startswith("target_precision:"):
-            target = float(strategy.split(":")[1])
-            idx = np.where(prec >= target)[0]
-            return float(thr[idx[0]]) if len(idx) else 1.0
-
-        # fallback
-        return 0.5
-
-    def get_feature_importance(self, df_sample: Optional[pd.DataFrame] = None, n_repeats: int = 5, random_state: int = 42) -> pd.DataFrame:
-        """
-        If a base RF exists, return its impurity importances.
-        If not (or additionally), and df_sample is provided, return permutation importances (more comparable across models).
-        """
-        rows = []
-
-        # Tree-based (fast)
-        if self.base_model is not None and hasattr(self.base_model, "feature_importances_"):
-            rows.extend([
-                {"feature": f, "importance": float(w), "kind": "rf_impurity"}
-                for f, w in zip(self.feature_columns, self.base_model.feature_importances_)
-            ])
-
-        # Permutation (optional, slower)
-        if df_sample is not None:
-            if "y_boundary" not in df_sample.columns:
-                raise ValueError("df_sample must include 'y_boundary' for permutation importance.")
-            X = self._prepare_matrix(df_sample.copy(), self.feature_columns)
-            y = df_sample["y_boundary"].astype(int).values
-            # sklearn permutation importance expects the original feature matrix; we wrap predict_proba
-            def _predict_proba(X_arr):
-                # create a temporary DF to respect column order on perturbation
-                tmp = pd.DataFrame(X_arr, columns=self.feature_columns)
-                return self.model.predict_proba(tmp.values)[:, 1]
-
-            # Workaround: sklearn's permutation_importance works with estimators; we provide a lambda
-            # Simplify by building a shallow wrapper
-            class _Wrapper:
-                def __init__(self, predict_fn): self.predict_fn = predict_fn
-                def predict(self, X_): 
-                    # convert probabilities to class for importance; or pass proba into scorer (default uses score method)
-                    # We'll instead use estimator with score method:
-                    from sklearn.metrics import roc_auc_score
-                    proba = self.predict_fn(X_)
-                    # Return a pseudo "score" per sample isn't supported; permutation_importance calls score(X, y)
-                    # So we implement score:
-                    self._y = None
-                    return proba
-                def score(self, X_, y_):
-                    from sklearn.metrics import roc_auc_score
-                    proba = self.predict_fn(X_)
-                    return roc_auc_score(y_, proba)
-
-            wrapper = _Wrapper(_predict_proba)
-            perm = permutation_importance(wrapper, X, y, n_repeats=n_repeats, random_state=random_state, n_jobs=-1)
-            rows.extend([
-                {"feature": f, "importance": float(imp), "kind": "permutation_auc"}
-                for f, imp in zip(self.feature_columns, perm.importances_mean)
-            ])
-
-        if not rows:
-            return pd.DataFrame(columns=["feature", "importance", "kind"]).sort_values("importance", ascending=False)
-
-        df_imp = pd.DataFrame(rows)
-        return df_imp.sort_values(["kind", "importance"], ascending=[True, False]).reset_index(drop=True)
-
-    # convenience for evaluation on a labeled frame
-    def evaluate_on(self, df: pd.DataFrame, threshold: Optional[float] = None) -> Dict[str, float]:
-        """Return simple metrics on a labeled DataFrame."""
-        if "y_boundary" not in df.columns:
-            raise ValueError("Evaluation DataFrame must contain 'y_boundary'.")
-        y_true = df["y_boundary"].astype(int).values
-        y_proba = self.predict_proba(df)
-        thr = self.threshold_ if threshold is None else float(threshold)
-        y_pred = (y_proba >= thr).astype(int)
-
-        # basic metrics
-        from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
-        out = {
-            "threshold": thr,
-            "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-            "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-            "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-            "roc_auc": float(roc_auc_score(y_true, y_proba)),
-        }
-        return out
+def evaluate_model_performance(model: BoundaryModel, 
+                             test_df: pd.DataFrame) -> Dict[str, Any]:
+    """Evaluate model performance on test set"""
+    
+    if test_df.empty:
+        return {}
+    
+    # Prepare data
+    metadata_cols = ['doc_id', 'page', 'span_id', 'y_boundary']
+    feature_cols = [c for c in test_df.columns if c not in metadata_cols]
+    
+    X_test = test_df[feature_cols].fillna(0)
+    y_test = test_df['y_boundary']
+    
+    # Predictions
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    # Metrics
+    from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+    
+    metrics = {
+        'accuracy': (y_pred == y_test).mean(),
+        'auc_roc': roc_auc_score(y_test, y_proba),
+        'auc_pr': average_precision_score(y_test, y_proba),
+        'classification_report': classification_report(y_test, y_pred, output_dict=True),
+        'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
+        'n_samples': len(y_test),
+        'threshold': model.threshold_
+    }
+    
+    return metrics
