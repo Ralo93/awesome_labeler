@@ -24,7 +24,7 @@ def draw_overlay(
     spans: List[Span],
     labels: Dict[Tuple[int, str], Label],
     selected_spans: List[str],
-    predictions: Optional[Dict[Tuple[str, str], float]] = None,
+    predictions: Optional[Dict[Tuple[int, str], float]] = None,
     show_heatmap: bool = True,
     show_unit_numbers: bool = True,
     zoom: float = 1.0
@@ -119,21 +119,25 @@ def draw_overlay(
             draw.text((text_x, text_y), unit_text, fill=(255, 255, 255, 255), font=font)
     
     # Draw predictions/confidence if available
+    # FIXED: Handle predictions with (page_number, span_id) keys
     if show_heatmap and predictions:
-        margin = 20 * zoom
-        bar_width = 15 * zoom
+        margin = 10 * zoom
+        bar_width = 8 * zoom
         
-        for (span_id_prev, span_id_curr), prob in predictions.items():
-            # Find the spans
-            prev_span = next((s for s in spans if s.span_id == span_id_prev), None)
-            curr_span = next((s for s in spans if s.span_id == span_id_curr), None)
+        # Sort spans by reading order for proper visualization
+        sorted_spans = sorted(spans, key=lambda s: s.reading_order)
+        
+        for span in sorted_spans:
+            key = (span.page_number, span.span_id)
             
-            if prev_span and curr_span:
-                prev_bbox = [coord * zoom for coord in prev_span.bbox]
-                curr_bbox = [coord * zoom for coord in curr_span.bbox]
+            if key in predictions:
+                prob = predictions[key]
                 
-                # Position bar between spans
-                y_center = (prev_bbox[3] + curr_bbox[1]) / 2
+                # Scale bbox
+                bbox = [coord * zoom for coord in span.bbox]
+                
+                # Position bar at the top of the span (indicating boundary probability)
+                y_position = bbox[1]  # Top of span
                 
                 # Color based on probability
                 if prob > 0.7:
@@ -144,25 +148,36 @@ def draw_overlay(
                     color = (0, 255, 0, 200)  # Green for low
                 
                 # Draw probability bar on the left margin
-                bar_height = max(2, int(prob * 20 * zoom))
+                bar_height = max(3, int(prob * 15 * zoom))
                 draw.rectangle(
-                    [margin, y_center - bar_height/2, margin + bar_width, y_center + bar_height/2],
+                    [margin, y_position - bar_height/2, margin + bar_width, y_position + bar_height/2],
                     fill=color,
                     outline=None
                 )
                 
-                # Add probability text
-                try:
-                    prob_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", int(10 * zoom))
-                except:
-                    prob_font = font
+                # Add probability text (only for high probability boundaries)
+                if prob > 0.5:
+                    try:
+                        prob_font = ImageFont.truetype("/System/Library/Fonts/Arial.ttf", int(9 * zoom))
+                    except:
+                        prob_font = font
+                    
+                    draw.text(
+                        (margin + bar_width + 2, y_position - 6),
+                        f"{prob:.2f}",
+                        fill=(100, 100, 100, 255),
+                        font=prob_font
+                    )
                 
-                draw.text(
-                    (margin + bar_width + 5, y_center - 5),
-                    f"{prob:.2f}",
-                    fill=(100, 100, 100, 255),
-                    font=prob_font
-                )
+                # Draw a thin line at high probability boundaries
+                if prob > st.session_state.get('boundary_threshold', 0.5):
+                    # Draw horizontal line above span to indicate predicted boundary
+                    line_y = bbox[1] - 2
+                    draw.line(
+                        [(bbox[0], line_y), (bbox[2], line_y)],
+                        fill=(255, 0, 0, 150),
+                        width=max(1, int(zoom))
+                    )
     
     # Draw selected spans (on top)
     for span in spans:

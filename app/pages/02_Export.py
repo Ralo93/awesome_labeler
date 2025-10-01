@@ -27,6 +27,33 @@ if not doc_ids:
     st.warning("No documents found. Please upload and label documents first.")
     st.stop()
 
+# Mode selection
+st.header("🎯 Export Mode")
+mode_col1, mode_col2 = st.columns([1, 2])
+
+with mode_col1:
+    simple_mode = st.checkbox(
+        "Simple Mode",
+        value=True,
+        help="Enable for iterative labeling workflow (no train/test split)"
+    )
+
+with mode_col2:
+    if simple_mode:
+        st.info("""
+        **Simple Mode Active** 🚀
+        - Export all labeled data as single training set
+        - Perfect for iterative labeling: label → train → predict → correct → retrain
+        - No train/test split
+        """)
+    else:
+        st.info("""
+        **Advanced Mode Active** 🧪
+        - Create train/test splits for model evaluation
+        - Use when you have enough labeled data for validation
+        - Automatic document-level splitting
+        """)
+
 # Document selection
 st.header("📋 Select Documents")
 st.info("Export labeled documents as training data for boundary detection model")
@@ -54,21 +81,28 @@ with col1:
         help="Name for the exported parquet file"
     )
     
-    test_size = st.slider(
-        "Test split size",
-        min_value=0.1,
-        max_value=0.5,
-        value=0.2,
-        step=0.05,
-        help="Fraction of documents to use for testing"
-    )
+    if not simple_mode:
+        test_size = st.slider(
+            "Test split size",
+            min_value=0.1,
+            max_value=0.5,
+            value=0.2,
+            step=0.05,
+            help="Fraction of documents to use for testing"
+        )
+    else:
+        test_size = 0.0  # No split in simple mode
 
 with col2:
-    random_state = st.number_input(
-        "Random seed",
-        value=42,
-        help="Seed for reproducible train/test splits"
-    )
+    if not simple_mode:
+        random_state = st.number_input(
+            "Random seed",
+            value=42,
+            help="Seed for reproducible train/test splits"
+        )
+    else:
+        random_state = 42  # Default, not used in simple mode
+        st.info("💡 No test split in simple mode")
 
 # Document statistics
 st.header("📊 Document Statistics")
@@ -76,10 +110,10 @@ st.header("📊 Document Statistics")
 if st.button("🔍 Analyze Documents"):
     doc_stats = []
     total_spans = 0
+    total_labeled = 0
     total_boundaries = 0
     
     for doc_id in selected_docs:
-        # Fix: Use load_spans directly instead of AppState.get_current_spans()
         spans = load_spans(doc_id)
         labels = load_labels(doc_id)
         
@@ -90,16 +124,24 @@ if st.button("🔍 Analyze Documents"):
         
         coverage = (n_labeled / n_spans * 100) if n_spans > 0 else 0
         
+        # Count labeled pages
+        if labels:
+            labeled_pages = len(set(l.page_number for l in labels.values()))
+        else:
+            labeled_pages = 0
+        
         doc_stats.append({
             'Document': doc_id,
             'Spans': n_spans,
             'Labeled': n_labeled,
             'Coverage (%)': f"{coverage:.1f}",
+            'Labeled Pages': labeled_pages,
             'Boundaries': n_boundaries,
             'Units': n_units
         })
         
         total_spans += n_spans
+        total_labeled += n_labeled
         total_boundaries += n_boundaries
     
     df_stats = pd.DataFrame(doc_stats)
@@ -110,12 +152,15 @@ if st.button("🔍 Analyze Documents"):
     with col1:
         st.metric("Total Documents", len(selected_docs))
     with col2:
-        st.metric("Total Spans", total_spans)
+        st.metric("Total Labeled Spans", total_labeled)
     with col3:
         st.metric("Total Boundaries", total_boundaries)
     with col4:
-        boundary_rate = (total_boundaries / total_spans * 100) if total_spans > 0 else 0
+        boundary_rate = (total_boundaries / total_labeled * 100) if total_labeled > 0 else 0
         st.metric("Boundary Rate", f"{boundary_rate:.1f}%")
+    
+    if simple_mode and total_labeled < 100:
+        st.warning("⚠️ Consider labeling more spans (at least 100) for better model performance")
 
 # Export section
 st.header("🚀 Export Training Data")
@@ -128,12 +173,13 @@ if st.button("📤 Export Training Data", type="primary"):
     else:
         with st.spinner("Exporting training data..."):
             try:
-                # Export with automatic train/test split
+                # Export with or without train/test split based on mode
                 full_df, train_df, test_df = export_training_data(
                     doc_ids=selected_docs,
                     output_path=export_path,
                     test_size=test_size,
-                    random_state=random_state
+                    random_state=random_state,
+                    simple_mode=simple_mode
                 )
                 
                 st.success("✅ Training data exported successfully!")
@@ -141,34 +187,56 @@ if st.button("📤 Export Training Data", type="primary"):
                 # Display export summary
                 st.subheader("📋 Export Summary")
                 
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Examples", len(full_df))
-                    st.metric("Training Examples", len(train_df))
-                    st.metric("Test Examples", len(test_df))
-                
-                with col2:
-                    st.metric("Features", len([c for c in full_df.columns if c not in ['doc_id', 'page', 'span_id', 'y_boundary']]))
-                    st.metric("Positive Boundaries", full_df['y_boundary'].sum())
-                    st.metric("Negative Boundaries", len(full_df) - full_df['y_boundary'].sum())
-                
-                with col3:
-                    boundary_rate = full_df['y_boundary'].mean() * 100
-                    st.metric("Boundary Rate", f"{boundary_rate:.1f}%")
+                if simple_mode:
+                    # Simple mode summary
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Labeled Examples", len(full_df))
+                        st.metric("Documents", len(selected_docs))
                     
-                    # Class balance in splits
-                    train_pos_rate = train_df['y_boundary'].mean() * 100
-                    test_pos_rate = test_df['y_boundary'].mean() * 100
-                    st.metric("Train Pos Rate", f"{train_pos_rate:.1f}%")
-                    st.metric("Test Pos Rate", f"{test_pos_rate:.1f}%")
-                
-                # File paths
-                st.subheader("📁 Generated Files")
-                st.code(f"""
+                    with col2:
+                        st.metric("Features", len([c for c in full_df.columns if c not in ['doc_id', 'page', 'span_id', 'y_boundary']]))
+                        st.metric("Positive Boundaries", full_df['y_boundary'].sum())
+                    
+                    with col3:
+                        boundary_rate = full_df['y_boundary'].mean() * 100
+                        st.metric("Boundary Rate", f"{boundary_rate:.1f}%")
+                        st.metric("Mode", "Simple (No Split)")
+                    
+                    # File paths
+                    st.subheader("📁 Generated File")
+                    st.code(f"Dataset: {export_path}")
+                    
+                else:
+                    # Advanced mode summary (with splits)
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Examples", len(full_df))
+                        st.metric("Training Examples", len(train_df))
+                        st.metric("Test Examples", len(test_df))
+                    
+                    with col2:
+                        st.metric("Features", len([c for c in full_df.columns if c not in ['doc_id', 'page', 'span_id', 'y_boundary']]))
+                        st.metric("Positive Boundaries", full_df['y_boundary'].sum())
+                        st.metric("Negative Boundaries", len(full_df) - full_df['y_boundary'].sum())
+                    
+                    with col3:
+                        boundary_rate = full_df['y_boundary'].mean() * 100
+                        st.metric("Boundary Rate", f"{boundary_rate:.1f}%")
+                        
+                        # Class balance in splits
+                        train_pos_rate = train_df['y_boundary'].mean() * 100
+                        test_pos_rate = test_df['y_boundary'].mean() * 100
+                        st.metric("Train Pos Rate", f"{train_pos_rate:.1f}%")
+                        st.metric("Test Pos Rate", f"{test_pos_rate:.1f}%")
+                    
+                    # File paths
+                    st.subheader("📁 Generated Files")
+                    st.code(f"""
 Full dataset: {export_path}
 Training set: {export_path.parent / f'train_{export_path.name}'}
 Test set: {export_path.parent / f'test_{export_path.name}'}
-                """)
+                    """)
                 
                 # Feature preview
                 st.subheader("🔍 Feature Preview")
@@ -197,6 +265,10 @@ if exports_dir.exists():
         st.write("Previously exported training datasets:")
         
         for file_path in sorted(export_files, reverse=True):
+            # Skip train_ and test_ prefixed files in the listing
+            if file_path.name.startswith('train_') or file_path.name.startswith('test_'):
+                continue
+                
             col1, col2, col3 = st.columns([3, 1, 1])
             
             with col1:
@@ -205,6 +277,14 @@ if exports_dir.exists():
                 size_mb = file_path.stat().st_size / (1024 * 1024)
                 mtime = pd.Timestamp.fromtimestamp(file_path.stat().st_mtime)
                 st.caption(f"Size: {size_mb:.1f} MB | Modified: {mtime.strftime('%Y-%m-%d %H:%M')}")
+                
+                # Check if train/test splits exist
+                train_path = file_path.parent / f'train_{file_path.name}'
+                test_path = file_path.parent / f'test_{file_path.name}'
+                if train_path.exists() and test_path.exists():
+                    st.caption("📊 Has train/test splits")
+                else:
+                    st.caption("📝 Simple mode export")
             
             with col2:
                 if st.button("📊 Info", key=f"info_{file_path.name}"):
@@ -219,7 +299,7 @@ if exports_dir.exists():
             with col3:
                 if st.button("🗑️ Delete", key=f"del_{file_path.name}"):
                     file_path.unlink()
-                    # Also try to delete train/test splits
+                    # Also try to delete train/test splits if they exist
                     train_path = file_path.parent / f'train_{file_path.name}'
                     test_path = file_path.parent / f'test_{file_path.name}'
                     if train_path.exists():
@@ -234,15 +314,31 @@ else:
 
 # Training instructions
 st.header("🎯 Next Steps")
-st.markdown("""
-After exporting training data:
 
-1. **Train the model**: Run the training script
-   ```bash
-   python train/train_model.py --input exports/{filename}.parquet
-   ```
-
-2. **Load trained model**: Use the model in the Label page for predictions
-
-3. **Iterate**: Label more documents → Export → Train → Repeat
-""")
+if simple_mode:
+    st.markdown("""
+    ### Simple Mode Workflow:
+    
+    1. **Label 1-2 pages** of your document
+    2. **Export** the labeled data (you just did this!)
+    3. **Train** a model in the Training page
+    4. **Apply predictions** to remaining pages in Label page
+    5. **Correct** any wrong predictions
+    6. **Export again** with corrected labels
+    7. **Retrain** the model with more data
+    8. **Repeat** until satisfied!
+    
+    This iterative approach helps you quickly build a good model with minimal manual labeling.
+    """)
+else:
+    st.markdown("""
+    ### Advanced Mode Workflow:
+    
+    1. **Label multiple documents** completely
+    2. **Export** with train/test split
+    3. **Train** and evaluate model performance
+    4. **Use model** for new documents
+    5. **Monitor** test set performance
+    
+    Use this mode when you have enough labeled data for proper evaluation.
+    """)

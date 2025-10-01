@@ -9,7 +9,7 @@ import joblib
 from app.state import AppState
 from app.components.overlay import draw_overlay
 from app.components.feature_panel import show_feature_panel
-from core.io import load_spans, load_labels, save_labels
+from core.io import save_labels
 from core.pdf_processor import render_pdf_page
 from core.schematas import Label
 from core.features import compute_sliding_window_features
@@ -51,8 +51,8 @@ def load_model(model_path: Path):
     except Exception as e:
         st.error(f"❌ Failed to load model: {e}")
 
-def apply_model_predictions(page_only: bool = True, overwrite: bool = False):
-    """Apply model predictions using sliding window features"""
+def apply_model_predictions(page_only: bool = True, overwrite: bool = False, auto_label: bool = True):
+    """Apply model predictions and optionally create semantic units"""
     if not st.session_state.model:
         st.error("No model loaded!")
         return
@@ -74,6 +74,9 @@ def apply_model_predictions(page_only: bool = True, overwrite: bool = False):
     
     # Generate predictions using sliding window features
     predictions = {}
+    feature_dicts = []  # Collect all features first
+    keys_to_predict = []  # Track which spans we're predicting
+    
     for local_idx, (global_idx, span) in enumerate(zip(span_indices, page_spans)):
         # Skip if already labeled and not overwriting
         key = (span.page_number, span.span_id)
@@ -82,28 +85,76 @@ def apply_model_predictions(page_only: bool = True, overwrite: bool = False):
         
         # Extract features using sliding window approach (pass global index)
         features = compute_sliding_window_features(spans, global_idx)
-        
-        # Convert to feature vector matching model expectations
-        if hasattr(st.session_state.model, 'feature_names_in_'):
-            feature_vector = [features.get(name, 0.0) for name in st.session_state.model.feature_names_in_]
-        else:
-            # Fallback: use all numeric features
-            feature_vector = [v for v in features.values() if isinstance(v, (int, float))]
-        
-        # Predict boundary probability
-        try:
-            prob = st.session_state.model.predict_proba([feature_vector])[0][1]  # Prob of boundary
-            predictions[key] = prob
-        except Exception as e:
-            st.error(f"Prediction error for {span.span_id}: {e}")
-            continue
+        feature_dicts.append(features)
+        keys_to_predict.append((key, span))  # Store both key and span for later
     
-    # Store predictions in session state for heatmap
+    if not feature_dicts:
+        st.info("No unlabeled spans to predict")
+        return
+    
+    # Predict all at once using list of dictionaries
+    try:
+        # The model's predict_proba method handles list of dictionaries properly
+        probs = st.session_state.model.predict_proba(feature_dicts)
+        
+        # Map predictions back to span keys
+        for (key, span), prob in zip(keys_to_predict, probs[:, 1]):
+            predictions[key] = prob
+            
+    except Exception as e:
+        st.error(f"Prediction error: {e}")
+        return
+    
+    # Store predictions in session state
     if 'predictions' not in st.session_state:
         st.session_state.predictions = {}
     st.session_state.predictions.update(predictions)
     
-    st.success(f"Generated {len(predictions)} predictions")
+    # Auto-create semantic units from predictions if enabled
+    if auto_label and predictions:
+        threshold = st.session_state.get('boundary_threshold', 0.5)
+        current_unit_id = f"unit_{st.session_state.unit_counter + 1}"
+        labels_to_add = {}
+        
+        # Sort spans by reading order for proper unit creation
+        sorted_predictions = sorted(keys_to_predict, key=lambda x: (x[1].page_number, x[1].reading_order))
+        
+        for (key, span) in sorted_predictions:
+            prob = predictions[key]
+            
+            # Determine if this starts a new unit
+            is_new_unit = prob >= threshold
+            if is_new_unit:
+                st.session_state.unit_counter += 1
+                current_unit_id = f"unit_{st.session_state.unit_counter}"
+                boundary = "new"
+            else:
+                boundary = "continue"
+            
+            label = Label(
+                span_id=span.span_id,
+                page_number=span.page_number,
+                boundary=boundary,
+                unit_id=current_unit_id,
+                confidence=float(prob)
+            )
+            labels_to_add[key] = label
+        
+        # Add to undo stack
+        if labels_to_add:
+            AppState.add_to_undo_stack({
+                'labels_added': labels_to_add
+            })
+            
+            # Update labels
+            st.session_state.labels.update(labels_to_add)
+            
+            # Save labels
+            save_labels(st.session_state.current_doc, st.session_state.labels)
+            
+            st.success(f"Generated {len(predictions)} predictions and created {st.session_state.unit_counter} semantic units")
+    else:
+        st.success(f"Generated {len(predictions)} predictions")
 
 def merge_selected_spans():
     """Merge selected spans into a single semantic unit"""
@@ -389,33 +440,63 @@ with st.sidebar:
                     load_model(model_dir / selected_model)
         else:
             st.info("No models found in /models")
-    
+        
     if st.session_state.model:
-        st.success(f"✅ {st.session_state.model_name}")
-        
-        # Prediction controls
-        st.subheader("Predictions")
-        if st.button("🔮 Predict Current Page"):
-            apply_model_predictions(page_only=True)
-        
-        if st.button("🔮 Predict All Pages"):
-            apply_model_predictions(page_only=False)
-        
-        # Boundary threshold
-        st.session_state.boundary_threshold = st.slider(
-            "Boundary Threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=st.session_state.get('boundary_threshold', 0.5),
-            step=0.05,
-            help="Probability threshold for new unit boundaries"
-        )
-        
-        if st.button("🤖 Auto-Label Remaining"):
-            auto_label_remaining()
-        
-        if st.button("🎯 Next Uncertain"):
-            next_uncertain()
+            st.success(f"✅ {st.session_state.model_name}")
+            
+            # Prediction controls
+            st.subheader("Predictions")
+            
+            # Boundary threshold - moved up so it's set before predictions
+            st.session_state.boundary_threshold = st.slider(
+                "Boundary Threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.get('boundary_threshold', 0.5),
+                step=0.05,
+                help="Probability threshold for new unit boundaries"
+            )
+            
+            # Check if current page has unlabeled spans
+            if st.session_state.current_doc:
+                spans = AppState.get_current_spans()
+                current_page = st.session_state.current_page
+                page_spans = [s for s in spans if s.page_number == current_page]
+                unlabeled_count = sum(1 for span in page_spans 
+                                    if (span.page_number, span.span_id) not in st.session_state.labels)
+                
+                if unlabeled_count > 0:
+                    st.info(f"📊 {unlabeled_count} unlabeled spans on this page")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🔮 Predict & Label Page", help="Generate predictions and create semantic units"):
+                    apply_model_predictions(page_only=True, auto_label=True)
+                    st.rerun()  # Force refresh to show new units
+            
+            with col2:
+                if st.button("👁️ Preview Only", help="Generate predictions without creating units"):
+                    apply_model_predictions(page_only=True, auto_label=False)
+            
+            if st.button("🔮 Predict & Label All Pages", help="Generate predictions for all pages"):
+                apply_model_predictions(page_only=False, auto_label=True)
+                st.rerun()
+            
+            # Only show this if predictions exist but haven't been converted to labels
+            if st.session_state.get('predictions'):
+                unlabeled_with_predictions = sum(
+                    1 for key in st.session_state.predictions 
+                    if key not in st.session_state.labels
+                )
+                if unlabeled_with_predictions > 0:
+                    if st.button(f"🏷️ Apply {unlabeled_with_predictions} Predictions", 
+                            help="Convert existing predictions to semantic units"):
+                        auto_label_remaining()
+                        st.rerun()
+            
+            if st.button("🎯 Next Uncertain"):
+                next_uncertain()
     
     st.divider()
     
