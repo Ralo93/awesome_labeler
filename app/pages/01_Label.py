@@ -702,7 +702,12 @@ with c6:
         AppState.refresh_data()
 
 with c7:
-    st.metric("Units", len(set(l.unit_id for l in st.session_state.labels.values())))
+    # Calculate units on current page only
+    page_units = set()
+    for key, label in st.session_state.labels.items():
+        if key[0] == st.session_state.current_page:  # Check if label is on current page
+            page_units.add(label.unit_id)
+    st.metric("Units (Page)", len(page_units))
 
 # Add rule-based labeling buttons below
 st.markdown("#### 🤖 Rule-Based Labeling")
@@ -789,57 +794,75 @@ if st.session_state.current_doc:
                 st.session_state.zoom_level = new_zoom
                 st.rerun()  # Force refresh for instant zoom
         # Replace the span selection section in 01_Label.py (starting from line ~437)
-
-        with right:
-            # Span selection interface with instant feedback
-            st.subheader("🔍 Span Selection")
-            
-            if page_spans:
-                # Use enumerate to ensure unique indices
-                for i, span in enumerate(page_spans):
-                    key = (span.page_number, span.span_id)
-                    is_selected = span.span_id in st.session_state.selected_spans
-                    is_labeled = key in st.session_state.labels
-                    
-                    # Use form for instant feedback
-                    with st.container():
-                        col1, col2 = st.columns([1, 4])
-                        
-                        with col1:
-                            # Use button with unique key including index
-                            button_label = "☑️" if is_selected else "⬜"
-                            # Include index i to ensure uniqueness even if span_ids repeat
-                            if st.button(
-                                button_label, 
-                                key=f"toggle_{span.page_number}_{span.span_id}_{i}",  # More unique key
-                                help=f"Toggle selection of {span.span_id}"
-                            ):
-                                toggle_span_selection(span.span_id)
-                                st.rerun()  # Force instant overlay refresh
-                        
-                        with col2:
-                            # Show span text preview
-                            text_preview = span.text[:60] + "..." if len(span.text) > 60 else span.text
+            # Replace the "with right:" section (starting around line 437) with this:
+            with right:
+                # Span selection interface with instant feedback
+                st.subheader("🔍 Span Selection")
+                
+                if page_spans:
+                    # Create the scrollable container
+                    with st.container(height=600):  # Fixed height container
+                        # Use enumerate to ensure unique indices
+                        for i, span in enumerate(page_spans):
+                            key = (span.page_number, span.span_id)
+                            is_selected = span.span_id in st.session_state.selected_spans
+                            is_labeled = key in st.session_state.labels
                             
-                            # Color coding based on state
-                            if is_labeled:
-                                label = st.session_state.labels[key]
-                                boundary_icon = "🆕" if label.boundary == "new" else "➡️"
-                                st.markdown(f"{boundary_icon} `{span.span_id}` - {text_preview}")
-                                st.caption(f"Unit: {label.unit_id}")
-                            else:
-                                color = "🔵" if is_selected else "⚪"
-                                st.markdown(f"{color} `{span.span_id}` - {text_preview}")
-                            
-                            # Show prediction if available
-                            if st.session_state.get('predictions') and key in st.session_state.predictions:
-                                prob = st.session_state.predictions[key]
-                                st.caption(f"🎯 Boundary prob: {prob:.3f}")
-            else:
-                st.info("No spans found on this page")
-            
-            # Feature panel
-            show_feature_panel(page_spans, st.session_state.labels, st.session_state.selected_spans)
+                            # Create a bordered container for each span
+                            with st.container():
+                                col1, col2 = st.columns([1, 4])
+                                
+                                with col1:
+                                    # Use button with unique key including index
+                                    button_label = "☑️" if is_selected else "⬜"
+                                    # Include index i to ensure uniqueness even if span_ids repeat
+                                    if st.button(
+                                        button_label, 
+                                        key=f"toggle_{span.page_number}_{span.span_id}_{i}",
+                                        help=f"Toggle selection of {span.span_id}"
+                                    ):
+                                        toggle_span_selection(span.span_id)
+                                        st.rerun()  # Force instant overlay refresh
+                                
+                                with col2:
+                                    # Show span text preview
+                                    text_preview = span.text[:60] + "..." if len(span.text) > 60 else span.text
+                                    
+                                    # Color coding based on state
+                                    if is_labeled:
+                                        label = st.session_state.labels[key]
+                                        boundary_icon = "🆕" if label.boundary == "new" else "➡️"
+                                        
+                                        # Extract unit number from unit_id if show_unit_numbers is enabled
+                                        unit_display = label.unit_id
+                                        if show_unit_numbers:
+                                            # Extract number from unit_id (e.g., "unit_42" -> "42")
+                                            unit_num = label.unit_id.split('_')[-1] if '_' in label.unit_id else label.unit_id
+                                            unit_display = f"#{unit_num}"
+                                        
+                                        st.markdown(f"{boundary_icon} `{span.span_id}` - {text_preview}")
+                                        
+                                        # Show unit with number if enabled
+                                        if show_unit_numbers:
+                                            st.caption(f"Unit: {unit_display} ({label.unit_id})")
+                                        else:
+                                            st.caption(f"Unit: {label.unit_id}")
+                                    else:
+                                        color = "🔵" if is_selected else "⚪"
+                                        st.markdown(f"{color} `{span.span_id}` - {text_preview}")
+                                    
+                                    # Show prediction if available
+                                    if st.session_state.get('predictions') and key in st.session_state.predictions:
+                                        prob = st.session_state.predictions[key]
+                                        st.caption(f"🎯 Boundary prob: {prob:.3f}")
+                                
+                                st.markdown("---")  # Separator between spans
+                else:
+                    st.info("No spans found on this page")
+                
+                # Feature panel below the scrollable area
+                #st.markdown("### 📊 Features")
+                #show_feature_panel(page_spans, st.session_state.labels, st.session_state.selected_spans)
 
     else:
         st.warning("No document loaded or PDF not found")
