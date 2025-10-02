@@ -5,7 +5,7 @@ import subprocess
 
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from core.visualization_export import export_comparison_visualization
+from core.visualization import export_comparison_visualization
 from app.state import AppState
 
 st.set_page_config(page_title="Visualize", page_icon="📊", layout="wide")

@@ -127,7 +127,7 @@ def extract_spans_from_pdf(pdf_path: Path, doc_id: str) -> List[Span]:
     _add_sequence_features(all_spans)
     
     # Final deduplication check across all pages (in case of repeated headers/footers)
-    all_spans = _deduplicate_cross_page(all_spans)
+    #all_spans = _deduplicate_cross_page(all_spans)
     
     doc.close()
     return all_spans

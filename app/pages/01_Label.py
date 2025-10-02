@@ -150,7 +150,7 @@ def apply_model_predictions(page_only: bool = True, overwrite: bool = False, aut
             st.session_state.labels.update(labels_to_add)
             
             # Save labels
-            save_labels(st.session_state.current_doc, st.session_state.labels)
+            #save_labels(st.session_state.current_doc, st.session_state.labels)
             
             st.success(f"Generated {len(predictions)} predictions and created {st.session_state.unit_counter} semantic units")
     else:
@@ -203,7 +203,7 @@ def merge_selected_spans():
     # Save labels
     save_labels(st.session_state.current_doc, st.session_state.labels)
     
-    st.success(f"Merged {len(selected_span_objs)} spans into {unit_id}")
+    #st.success(f"Merged {len(selected_span_objs)} spans into {unit_id}")
 
 def auto_label_remaining():
     """Auto-label remaining unlabeled spans on the current page using model predictions"""
@@ -302,7 +302,7 @@ def clear_page_labels():
         del st.session_state.labels[key]
     
     # Save labels
-    save_labels(st.session_state.current_doc, st.session_state.labels)
+    #save_labels(st.session_state.current_doc, st.session_state.labels)
     
     st.success(f"Cleared {len(labels_to_remove)} labels from page {page_num}")
 
@@ -351,7 +351,7 @@ def split_unit():
     # Save labels
     save_labels(st.session_state.current_doc, st.session_state.labels)
     
-    st.success(f"Split {len(selected_span_objs)} spans into separate units")
+    #st.success(f"Split {len(selected_span_objs)} spans into separate units")
 
 def undo_action():
     """Undo last action"""
@@ -361,7 +361,7 @@ def save_current_labels():
     """Save current labels to disk"""
     if st.session_state.current_doc:
         save_labels(st.session_state.current_doc, st.session_state.labels)
-        st.success("Labels saved!")
+        #st.success("Labels saved!")
 
 def toggle_span_selection(span_id: str):
     """Toggle span selection and force rerun for instant feedback"""
@@ -669,7 +669,7 @@ def label_rest_as_single_units():
     # Save labels
     save_labels(st.session_state.current_doc, st.session_state.labels)
     
-    st.success(f"Labeled {len(labels_to_add)} spans as individual units on page {current_page}")
+    #st.success(f"Labeled {len(labels_to_add)} spans as individual units on page {current_page}")
 
 # Toolbar
 st.markdown("### 🎯 Labeling Workflow")

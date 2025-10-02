@@ -1,12 +1,10 @@
 import io
 import streamlit as st
 import sys
-import tempfile
-import os
 from pathlib import Path
 from PIL import Image
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Callable
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import Rectangle
@@ -14,9 +12,14 @@ import cv2
 import json
 import torch
 from dataclasses import dataclass, field
+import time
+from functools import wraps
+from datetime import datetime
+
+from core.helpers import measure_processing_time
 
 # Page configuration
-st.set_page_config(page_title="Docling Heron Layout Detection", page_icon="🔬", layout="wide")
+st.set_page_config(page_title="Document Layout Detection with docling-layout", page_icon="🔬", layout="wide")
 
 # Initialize session state
 if 'current_doc' not in st.session_state:
@@ -25,49 +28,38 @@ if 'current_page' not in st.session_state:
     st.session_state.current_page = 1
 if 'detection_results' not in st.session_state:
     st.session_state.detection_results = []
-if 'docling_model' not in st.session_state:
-    st.session_state.docling_model = None
-if 'docling_processor' not in st.session_state:
-    st.session_state.docling_processor = None
+if 'layout_model' not in st.session_state:
+    st.session_state.layout_model = None
+if 'processing_times' not in st.session_state:
+    st.session_state.processing_times = []
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
 
-# Category types with ID mappings for Docling/LayoutLMv3 style models
-CATEGORY_ID_MAP = {
-    0: 'text',
-    1: 'title',
-    2: 'list',
-    3: 'table',
-    4: 'figure',
-    5: 'figure_caption',
-    6: 'table_caption',
-    7: 'section_header',
-    8: 'footer',
-    9: 'header',
-    10: 'reference',
-    11: 'equation',
-    12: 'abstract',
-    13: 'code',
-    14: 'paragraph',
-    15: 'page_number',
-}
-
+# Category types for layout detection
 CATEGORY_TYPES = {
     'title': {'color': '#FF6B6B', 'label': 'Title'},
     'text': {'color': '#4ECDC4', 'label': 'Text'},
+    'plain_text': {'color': '#4ECDC4', 'label': 'Plain Text'},
     'paragraph': {'color': '#4ECDC4', 'label': 'Paragraph'},
-    'abstract': {'color': '#45B7D1', 'label': 'Abstract'},
     'figure': {'color': '#95E77E', 'label': 'Figure'},
     'figure_caption': {'color': '#7FD157', 'label': 'Figure Caption'},
     'table': {'color': '#FFE66D', 'label': 'Table'},
     'table_caption': {'color': '#F4D03F', 'label': 'Table Caption'},
-    'equation': {'color': '#DDA0DD', 'label': 'Equation'},
+    'table_footnote': {'color': '#E8C547', 'label': 'Table Footnote'},
     'formula': {'color': '#DDA0DD', 'label': 'Formula'},
+    'equation': {'color': '#DDA0DD', 'label': 'Equation'},
+    'isolate_formula': {'color': '#BA55D3', 'label': 'Block Formula'},
+    'formula_caption': {'color': '#9370DB', 'label': 'Formula Caption'},
     'header': {'color': '#FFA07A', 'label': 'Header'},
     'footer': {'color': '#FFB6C1', 'label': 'Footer'},
     'page_number': {'color': '#D3D3D3', 'label': 'Page Number'},
     'list': {'color': '#87CEEB', 'label': 'List'},
+    'list_item': {'color': '#87CEEB', 'label': 'List Item'},
+    'enumeration': {'color': '#6495ED', 'label': 'Enumeration'},
     'reference': {'color': '#FF69B4', 'label': 'Reference'},
     'section_header': {'color': '#FFA07A', 'label': 'Section Header'},
     'code': {'color': '#98FB98', 'label': 'Code Block'},
+    'abandon': {'color': '#808080', 'label': 'Abandoned'},
 }
 
 @dataclass
@@ -82,114 +74,143 @@ class ContentBlock:
     metadata: Optional[Dict] = field(default_factory=dict)
 
 @st.cache_resource
-def load_docling_model():
-    """Load a document layout detection model"""
+def load_huggingpanda_model():
+    """Load HuggingPanda/docling-layout model"""
     try:
-        # Try multiple approaches to get a working model
+        from transformers import AutoModel, AutoProcessor, AutoModelForObjectDetection
         
-        # Approach 1: Try LayoutLMv3 which is proven for layout detection
-        try:
-            from transformers import LayoutLMv3ForTokenClassification, LayoutLMv3Processor
-            from transformers import AutoModelForObjectDetection, AutoProcessor
+        with st.spinner("Loading HuggingPanda/docling-layout model..."):
+            model_name = "HuggingPanda/docling-layout"
             
-            with st.spinner("Loading LayoutLMv3 for document layout detection..."):
-                # Use Microsoft's LayoutLMv3 for layout detection
+            try:
+                # Try loading as object detection model first
                 model = AutoModelForObjectDetection.from_pretrained(
-                    "microsoft/layoutlmv3-base",
+                    model_name,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                     trust_remote_code=True
                 )
                 processor = AutoProcessor.from_pretrained(
-                    "microsoft/layoutlmv3-base",
-                    trust_remote_code=True,
-                    apply_ocr=False
+                    model_name,
+                    trust_remote_code=True
                 )
-                return model, processor, "layoutlmv3"
-        except:
-            pass
-        
-        # Approach 2: Try DETR-based layout model
-        try:
-            from transformers import DetrForObjectDetection, DetrImageProcessor
-            
-            with st.spinner("Loading DETR-based layout detection model..."):
-                # Use a DETR model fine-tuned for document layout
-                model = DetrForObjectDetection.from_pretrained(
-                    "facebook/detr-resnet-50",
-                    num_labels=len(CATEGORY_ID_MAP),
-                    ignore_mismatched_sizes=True
+            except:
+                # Fallback to general AutoModel
+                model = AutoModel.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True
                 )
-                processor = DetrImageProcessor.from_pretrained(
-                    "facebook/detr-resnet-50"
+                processor = AutoProcessor.from_pretrained(
+                    model_name,
+                    trust_remote_code=True
                 )
-                return model, processor, "detr"
-        except:
-            pass
-        
-        # Approach 3: Try YOLOs for document layout
-        try:
-            from ultralytics import YOLO
             
-            with st.spinner("Loading YOLO-based layout detection..."):
-                # Use a YOLO model (you might need a document-specific one)
-                model = YOLO('yolov8n.pt')  # You can use a custom trained model here
-                return model, None, "yolo"
-        except:
-            pass
-        
-        # Approach 4: Fallback to Detectron2
-        try:
-            from detectron2.config import get_cfg
-            from detectron2 import model_zoo
-            from detectron2.engine import DefaultPredictor
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            st.session_state["docling_device"] = device
+            model = model.to(device)
+            model.eval()
             
-            with st.spinner("Loading Detectron2 layout model..."):
-                cfg = get_cfg()
-                cfg.merge_from_file(model_zoo.get_config_file("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml"))
-                cfg.MODEL.ROI_HEADS.NUM_CLASSES = len(CATEGORY_ID_MAP)
-                cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
-                cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-                predictor = DefaultPredictor(cfg)
-                return predictor, None, "detectron2"
-        except:
-            pass
-        
-        st.error("""
-        No suitable layout detection model could be loaded. Please install one of:
+            # Create wrapper for consistent interface
+            class HuggingPandaWrapper:
+                def __init__(self, model, processor):
+                    self.model = model
+                    self.processor = processor
+                    self.device = device
+                    self.label_map = {
+                        0: 'title', 1: 'text', 2: 'figure', 3: 'table',
+                        4: 'list', 5: 'equation', 6: 'section_header',
+                        7: 'footer', 8: 'header', 9: 'reference',
+                        10: 'figure_caption', 11: 'table_caption',
+                        12: 'code', 13: 'paragraph', 14: 'formula',
+                        15: 'list_item', 16: 'page_number'
+                    }
+                
+                @measure_processing_time(model_name="HuggingPanda/docling-layout")
+                def detect(self, image: Image.Image, page_num: int = 1) -> List[ContentBlock]:
+                    # Preprocess image
+                    inputs = self.processor(images=image, return_tensors="pt")
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    
+                    # Run inference
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                    
+                    # Process outputs
+                    blocks = []
+                    
+                    # Handle object detection outputs
+                    if hasattr(outputs, 'logits'):
+                        # Get predictions
+                        logits = outputs.logits
+                        boxes = outputs.pred_boxes if hasattr(outputs, 'pred_boxes') else None
+                        
+                        if boxes is not None:
+                            # Post-process predictions
+                            target_sizes = torch.tensor([image.size[::-1]])
+                            results = self.processor.post_process_object_detection(
+                                outputs, 
+                                target_sizes=target_sizes,
+                                threshold=0.5
+                            )[0]
+                            
+                            for score, label, box in zip(
+                                results["scores"], 
+                                results["labels"], 
+                                results["boxes"]
+                            ):
+                                box = box.cpu().numpy()
+                                block_type = self.label_map.get(label.item(), 'text')
+                                
+                                blocks.append(ContentBlock(
+                                    type=block_type,
+                                    bbox=box.tolist(),
+                                    confidence=score.item(),
+                                    page_idx=page_num - 1,
+                                    content=f"{block_type.replace('_', ' ').title()} Block"
+                                ))
+                    
+                    return blocks
+            
+            return HuggingPandaWrapper(model, processor)
+            
+    except ImportError as e:
+        st.error(f"""
+        Required libraries not installed. Please install:
         ```bash
-        # Option 1: LayoutLMv3
-        pip install transformers>=4.40.0 torch torchvision
-        
-        # Option 2: YOLO
-        pip install ultralytics
-        
-        # Option 3: Detectron2
-        pip install detectron2
+        pip install transformers>=4.40.0
+        pip install torch torchvision
+        pip install accelerate
         ```
+        Error: {str(e)}
         """)
-        return None, None, None
-        
+        return None
     except Exception as e:
-        st.error(f"Failed to load model: {str(e)}")
-        return None, None, None
+        st.error(f"Failed to load HuggingPanda/docling-layout model: {str(e)}")
+        return None
 
-def render_pdf_page(pdf_path: Path, page_num: int) -> Image.Image:
-    """Render a PDF page as an image"""
+def render_pdf_page(pdf_path: Path, page_num: int) -> Optional[Image.Image]:
+    """
+    Render a PDF page as an image
+    
+    Args:
+        pdf_path: Path to PDF file
+        page_num: Page number (0-based index)
+        
+    Returns:
+        PIL Image or None if error
+    """
     try:
         import fitz  # PyMuPDF
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(str(pdf_path))
         
         # Validate page number
-        if doc.page_count == 0:
-            st.error("PDF file appears to be empty")
-            doc.close()
-            return None
-            
-        if page_num < 0 or page_num >= doc.page_count:
-            st.error(f"Page {page_num + 1} does not exist. Document has {doc.page_count} pages.")
+        if page_num < 0 or page_num >= len(doc):
+            st.error(f"Page {page_num} out of range. PDF has {len(doc)} pages.")
             doc.close()
             return None
         
-        page = doc.load_page(page_num)
+        # Use array indexing (0-based)
+        page = doc[page_num]
         mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better quality
         pix = page.get_pixmap(matrix=mat)
         img_data = pix.tobytes("png")
@@ -200,123 +221,14 @@ def render_pdf_page(pdf_path: Path, page_num: int) -> Image.Image:
         st.error("PyMuPDF not installed. Please install: pip install pymupdf")
         return None
     except Exception as e:
-        st.error(f"Error rendering PDF page: {str(e)}")
+        st.error(f"Error rendering page: {str(e)}")
         return None
 
-def detect_layout_model(image: Image.Image, model, processor, model_type: str) -> List[ContentBlock]:
-    """Perform layout detection using loaded model"""
-    if model is None:
-        return []
-    
-    blocks = []
-    img_w, img_h = image.size
-    
-    try:
-        if model_type == "layoutlmv3":
-            # Process image
-            inputs = processor(images=image, return_tensors="pt")
-            
-            # Run inference
-            with torch.no_grad():
-                outputs = model(**inputs)
-            
-            # Post-process predictions
-            target_sizes = torch.tensor([image.size[::-1]])
-            results = processor.post_process_object_detection(outputs, threshold=0.5, target_sizes=target_sizes)[0]
-            
-            for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
-                box = box.tolist()
-                label_id = label.item()
-                block_type = CATEGORY_ID_MAP.get(label_id, 'text')
-                
-                blocks.append(ContentBlock(
-                    type=block_type,
-                    bbox=[box[0]/img_w, box[1]/img_h, box[2]/img_w, box[3]/img_h],
-                    confidence=score.item(),
-                    content=f"{block_type.replace('_', ' ').title()} Region"
-                ))
-        
-        elif model_type == "detr":
-            # Process image
-            inputs = processor(images=image, return_tensors="pt")
-            
-            # Run inference
-            with torch.no_grad():
-                outputs = model(**inputs)
-            
-            # Post-process
-            target_sizes = torch.tensor([image.size[::-1]])
-            results = processor.post_process_object_detection(outputs, threshold=0.5, target_sizes=target_sizes)[0]
-            
-            for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
-                box = box.tolist()
-                label_id = label.item()
-                block_type = CATEGORY_ID_MAP.get(label_id, 'text')
-                
-                blocks.append(ContentBlock(
-                    type=block_type,
-                    bbox=[box[0]/img_w, box[1]/img_h, box[2]/img_w, box[3]/img_h],
-                    confidence=score.item(),
-                    content=f"{block_type.replace('_', ' ').title()} Region"
-                ))
-        
-        elif model_type == "yolo":
-            # Run YOLO inference
-            results = model(image)
-            
-            for r in results:
-                boxes = r.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        xyxy = box.xyxy[0].tolist()
-                        conf = box.conf.item()
-                        cls = int(box.cls.item())
-                        
-                        block_type = CATEGORY_ID_MAP.get(cls, 'text')
-                        
-                        blocks.append(ContentBlock(
-                            type=block_type,
-                            bbox=[xyxy[0]/img_w, xyxy[1]/img_h, xyxy[2]/img_w, xyxy[3]/img_h],
-                            confidence=conf,
-                            content=f"{block_type.replace('_', ' ').title()} Region"
-                        ))
-        
-        elif model_type == "detectron2":
-            # Convert PIL to numpy
-            img_array = np.array(image)
-            
-            # Run inference
-            outputs = model(img_array)
-            instances = outputs["instances"].to("cpu")
-            
-            for i in range(len(instances)):
-                box = instances.pred_boxes[i].tensor.numpy()[0]
-                score = instances.scores[i].item()
-                label = instances.pred_classes[i].item()
-                
-                block_type = CATEGORY_ID_MAP.get(label, 'text')
-                
-                blocks.append(ContentBlock(
-                    type=block_type,
-                    bbox=[box[0]/img_w, box[1]/img_h, box[2]/img_w, box[3]/img_h],
-                    confidence=score,
-                    content=f"{block_type.replace('_', ' ').title()} Region"
-                ))
-        
-        # If no blocks detected, use fallback
-        if len(blocks) == 0:
-            st.warning("Model didn't detect any blocks. Using fallback detection...")
-            return detect_layout_fallback(image)
-        
-        return blocks
-        
-    except Exception as e:
-        st.warning(f"Model inference failed: {str(e)}. Using fallback detection...")
-        return detect_layout_fallback(image)
+st.warning(f"Using device: {st.session_state.get('docling_device', 'unknown')}")
 
-def detect_layout_fallback(image: Image.Image) -> List[ContentBlock]:
-    """Enhanced fallback layout detection using CV methods"""
-    # Convert to numpy array
+@measure_processing_time(model_name="CV-Fallback")
+def detect_layout_fallback(image: Image.Image, page_num: int = 1) -> List[ContentBlock]:
+    """Fallback layout detection using simple CV methods"""
     img_array = np.array(image)
     
     # Convert to grayscale
@@ -325,64 +237,43 @@ def detect_layout_fallback(image: Image.Image) -> List[ContentBlock]:
     else:
         gray = img_array
     
-    # Apply adaptive threshold for better results
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                  cv2.THRESH_BINARY_INV, 11, 2)
-    
-    # Morphological operations to merge text regions
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 10))
-    dilated = cv2.dilate(binary, kernel, iterations=1)
+    # Apply threshold
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
     
     # Find contours
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     blocks = []
     img_h, img_w = gray.shape[:2]
-    
-    # Sort contours by position (top to bottom, left to right)
-    contours = sorted(contours, key=lambda c: (cv2.boundingRect(c)[1], cv2.boundingRect(c)[0]))
     
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         
         # Filter small contours
-        if w < 30 or h < 15:
+        if w < 20 or h < 10:
             continue
         
-        # Calculate features for classification
-        aspect_ratio = w / h
-        area_ratio = (w * h) / (img_w * img_h)
-        position_y = y / img_h
-        position_x = x / img_w
+        # Store actual pixel coordinates
+        bbox = [x, y, x+w, y+h]
         
-        # Enhanced heuristic classification
-        if position_y < 0.1 and w > img_w * 0.3:
-            block_type = 'header'
-        elif position_y > 0.9:
-            block_type = 'footer'
-        elif aspect_ratio > 3 and position_y < 0.2:
-            block_type = 'title'
-        elif aspect_ratio > 5 and w > img_w * 0.6:
-            block_type = 'section_header'
-        elif area_ratio > 0.3:
-            block_type = 'figure'  # Large blocks might be figures
-        elif aspect_ratio > 1.5 and aspect_ratio < 4 and area_ratio > 0.05:
-            block_type = 'table'  # Medium-sized rectangular blocks
-        elif w < img_w * 0.1 and position_x < 0.2:
-            block_type = 'list'  # Small blocks on the left
-        elif h > img_h * 0.05 and w > img_w * 0.4:
-            block_type = 'paragraph'
-        else:
+        # Simple heuristic classification
+        if h > img_h * 0.15:
             block_type = 'text'
-        
-        # Normalize bbox
-        bbox = [x/img_w, y/img_h, (x+w)/img_w, (y+h)/img_h]
+        elif y < img_h * 0.1:
+            block_type = 'header'
+        elif y > img_h * 0.9:
+            block_type = 'footer'
+        elif w > img_w * 0.7 and h < img_h * 0.05:
+            block_type = 'title'
+        else:
+            block_type = 'plain_text'
         
         blocks.append(ContentBlock(
             type=block_type,
             bbox=bbox,
             content=f"{block_type.replace('_', ' ').title()} Block",
-            confidence=0.7  # Lower confidence for fallback
+            confidence=0.8,
+            page_idx=page_num - 1
         ))
     
     return blocks
@@ -395,8 +286,6 @@ def visualize_layout(image: Image.Image, blocks: List[ContentBlock], show_labels
     ax.imshow(image)
     ax.axis('off')
     
-    img_w, img_h = image.size
-    
     # Draw bounding boxes
     for idx, block in enumerate(blocks):
         # Get block type info
@@ -404,16 +293,8 @@ def visualize_layout(image: Image.Image, blocks: List[ContentBlock], show_labels
         color = block_info['color']
         label = block_info['label']
         
-        # Convert normalized bbox to pixel coordinates
-        if all(0 <= v <= 1.1 for v in block.bbox):  # Allow slight overflow
-            x1 = block.bbox[0] * img_w
-            y1 = block.bbox[1] * img_h
-            x2 = block.bbox[2] * img_w
-            y2 = block.bbox[3] * img_h
-        else:
-            # Already in pixel coordinates
-            x1, y1, x2, y2 = block.bbox
-        
+        # Get box coordinates
+        x1, y1, x2, y2 = block.bbox
         width = x2 - x1
         height = y2 - y1
         
@@ -432,16 +313,10 @@ def visualize_layout(image: Image.Image, blocks: List[ContentBlock], show_labels
             # Position label
             label_y = y1 - 5 if y1 > 20 else y1 + height + 15
             
-            # Add confidence to label if not 1.0
-            if block.confidence < 0.99:
-                label_text = f"{idx}: {label} ({block.confidence:.2f})"
-            else:
-                label_text = f"{idx}: {label}"
-            
             # Add background for better readability
             ax.text(
                 x1, label_y,
-                label_text,
+                f"{idx}: {label}",
                 color='white',
                 fontsize=8,
                 weight='bold',
@@ -484,18 +359,14 @@ with st.sidebar:
     
     # File uploader
     uploaded_file = st.file_uploader(
-        "Upload PDF or Image",
-        type=['pdf', 'png', 'jpg', 'jpeg'],
-        help="Select a document to analyze"
+        "Upload PDF",
+        type=['pdf'],
+        help="Select a PDF file to analyze"
     )
     
     if uploaded_file:
-        # Create temp directory if it doesn't exist
-        temp_dir = Path(tempfile.gettempdir()) / "docling_uploads"
-        temp_dir.mkdir(exist_ok=True)
-        
-        # Save uploaded file
-        temp_path = temp_dir / uploaded_file.name
+        # Save uploaded file temporarily
+        temp_path = Path(f"/tmp/{uploaded_file.name}")
         with open(temp_path, 'wb') as f:
             f.write(uploaded_file.getbuffer())
         st.session_state.current_doc = temp_path
@@ -506,23 +377,46 @@ with st.sidebar:
     # Model settings
     st.header("⚙️ Model Settings")
     
-    use_model = st.checkbox(
-        "Use ML Model",
+    # Model selection
+    use_huggingpanda = st.checkbox(
+        "Use HuggingPanda/docling-layout",
         value=True,
-        help="Use machine learning model for layout detection"
+        help="Use HuggingPanda docling-layout model for advanced detection"
     )
     
-    if use_model:
-        if st.button("🔧 Load Detection Model", type="primary", use_container_width=True):
-            with st.spinner("Loading model..."):
-                model, processor, model_type = load_docling_model()
-                st.session_state.docling_model = model
-                st.session_state.docling_processor = processor
-                st.session_state.model_type = model_type
-                if model:
-                    st.success(f"Model loaded successfully! Type: {model_type}")
+    # Model status display
+    st.markdown("### 🤖 Active Detection Method")
+    
+    if use_huggingpanda:
+        if st.session_state.layout_model is not None:
+            st.success("✅ **HuggingPanda Model Ready**")
+            st.caption("Advanced neural network detection")
+            st.session_state.model_loaded = True
+        else:
+            st.warning("⚠️ **Model Not Loaded**")
+            st.caption("Click 'Load Model' to enable")
+            st.session_state.model_loaded = False
+            
+            if st.button("🔧 Load Model", type="primary", use_container_width=True):
+                with st.spinner("Loading model..."):
+                    st.session_state.layout_model = load_huggingpanda_model()
+                    if st.session_state.layout_model:
+                        st.success("Model loaded successfully!")
+                        st.session_state.model_loaded = True
+                        st.rerun()
     else:
-        st.info("Using CV-based detection only")
+        st.info("🔄 **CV-Based Fallback Active**")
+        st.caption("Simple computer vision detection")
+        st.session_state.model_loaded = False
+    
+    st.divider()
+    
+    # Detection preview
+    st.markdown("### 📋 Detection Preview")
+    if use_huggingpanda and st.session_state.model_loaded:
+        st.info("**Will use:** HuggingPanda/docling-layout")
+    else:
+        st.info("**Will use:** CV-based Fallback")
     
     st.divider()
     
@@ -541,13 +435,19 @@ with st.sidebar:
         help="Display color legend for block types"
     )
     
-    show_confidence = st.checkbox(
-        "Show Confidence Scores",
-        value=True,
-        help="Display confidence scores in labels"
-    )
-    
     st.divider()
+    
+    # Processing metrics
+    if st.session_state.processing_times:
+        st.header("⏱️ Performance Metrics")
+        
+        latest = st.session_state.processing_times[-1]
+        st.metric("Last Processing Time", f"{latest.processing_time:.3f}s")
+        st.metric("Blocks Detected", latest.num_blocks_detected)
+        
+        if len(st.session_state.processing_times) > 1:
+            avg_time = np.mean([m.processing_time for m in st.session_state.processing_times])
+            st.metric("Avg Processing Time", f"{avg_time:.3f}s")
     
     # Detection stats
     if st.session_state.detection_results:
@@ -555,90 +455,83 @@ with st.sidebar:
         
         # Count blocks by type
         type_counts = {}
-        avg_confidence = {}
         for block in st.session_state.detection_results:
             type_counts[block.type] = type_counts.get(block.type, 0) + 1
-            if block.type not in avg_confidence:
-                avg_confidence[block.type] = []
-            avg_confidence[block.type].append(block.confidence)
         
         for block_type, count in sorted(type_counts.items()):
             info = CATEGORY_TYPES.get(block_type, {'label': block_type})
-            avg_conf = sum(avg_confidence[block_type]) / len(avg_confidence[block_type])
-            st.metric(info['label'], count, f"Conf: {avg_conf:.2f}")
+            st.metric(info['label'], count)
 
 # Main content
 st.title("🔬 Document Layout Detection")
-st.markdown("Advanced document layout analysis using state-of-the-art models")
+st.markdown("Advanced document layout analysis using HuggingPanda/docling-layout model")
+
+# Model status banner
+if use_huggingpanda:
+    if st.session_state.model_loaded:
+        st.success("🟢 **HuggingPanda/docling-layout model is active and ready**")
+    else:
+        st.warning("🟡 **HuggingPanda model selected but not loaded** - Will use CV fallback until model is loaded")
+else:
+    st.info("🔵 **CV-based fallback detection is active**")
 
 if st.session_state.current_doc:
-    doc_path = Path(st.session_state.current_doc)
+    pdf_path = Path(st.session_state.current_doc)
     
-    if doc_path.exists():
-        # Check if it's a PDF or image
-        is_pdf = doc_path.suffix.lower() == '.pdf'
+    if pdf_path.exists():
+        # Get number of pages
+        try:
+            import fitz
+            doc = fitz.open(str(pdf_path))
+            num_pages = len(doc)
+            doc.close()
+        except:
+            num_pages = 1
         
-        if is_pdf:
-            # Get number of pages
-            try:
-                import fitz
-                doc = fitz.open(doc_path)
-                num_pages = doc.page_count
-                doc.close()
-                
-                # Check if PDF is empty
-                if num_pages == 0:
-                    st.error("The uploaded PDF file is empty or corrupted.")
-                    st.stop()
-            except Exception as e:
-                st.error(f"Error reading PDF file: {str(e)}")
-                st.stop()
-            
-            # Page navigation
-            col1, col2, col3 = st.columns([1, 3, 1])
-            with col2:
-                # Ensure current page is within valid range
-                if st.session_state.current_page > num_pages:
-                    st.session_state.current_page = 1
-                
-                page_num = st.slider(
-                    "Select Page",
-                    min_value=1,
-                    max_value=num_pages,
-                    value=st.session_state.current_page,
-                    key="page_slider"
-                )
-                st.session_state.current_page = page_num
-            
-            # Render current page
-            page_image = render_pdf_page(doc_path, page_num - 1)
-        else:
-            # Load image directly
-            page_image = Image.open(doc_path)
-            page_num = 1
+        # Page navigation
+        col1, col2, col3 = st.columns([1, 3, 1])
+        with col2:
+            page_num = st.slider(
+                "Select Page",
+                min_value=1,
+                max_value=num_pages,
+                value=st.session_state.current_page,
+                key="page_slider"
+            )
+            st.session_state.current_page = page_num
+        
+        # Render current page (convert 1-based to 0-based for render function)
+        page_image = render_pdf_page(pdf_path, page_num - 1)
         
         if page_image:
-            # Run detection button
+            # Detection method indicator
+            st.markdown("---")
             col1, col2, col3 = st.columns([1, 2, 1])
+            
             with col2:
-                if st.button("🚀 Run Layout Detection", type="primary", use_container_width=True):
-                    with st.spinner("Detecting layout..."):
-                        if use_model and st.session_state.docling_model:
-                            # Use ML model
-                            blocks = detect_layout_model(
-                                page_image, 
-                                st.session_state.docling_model, 
-                                st.session_state.docling_processor,
-                                st.session_state.get('model_type', 'unknown')
-                            )
-                            method = st.session_state.get('model_type', 'ML Model')
+                # Show what will happen when button is clicked
+                if use_huggingpanda and st.session_state.model_loaded:
+                    detection_method = "HuggingPanda/docling-layout"
+                    button_color = "primary"
+                    button_text = "🚀 Run HuggingPanda Detection"
+                else:
+                    detection_method = "CV-based Fallback"
+                    button_color = "secondary"
+                    button_text = "🔄 Run CV Fallback Detection"
+                
+                st.info(f"**Ready to detect using:** {detection_method}")
+                
+                if st.button(button_text, type=button_color, use_container_width=True):
+                    with st.spinner(f"Detecting layout using {detection_method}..."):
+                        if use_huggingpanda and st.session_state.model_loaded:
+                            # Use HuggingPanda model
+                            blocks = st.session_state.layout_model.detect(page_image, page_num)
                         else:
                             # Use fallback method
-                            blocks = detect_layout_fallback(page_image)
-                            method = "CV-based Detection"
+                            blocks = detect_layout_fallback(page_image, page_num)
                         
                         st.session_state.detection_results = blocks
-                        st.success(f"Detected {len(blocks)} blocks using {method}")
+                        st.success(f"✅ Detected {len(blocks)} blocks using {detection_method}")
             
             # Display results
             if st.session_state.detection_results:
@@ -672,11 +565,9 @@ if st.session_state.current_doc:
                             st.write(f"**Confidence:** {block.confidence:.2f}")
                         with col3:
                             st.write(f"**Angle:** {block.angle if block.angle else 'None'}")
-                        st.write(f"**BBox:** [{block.bbox[0]:.3f}, {block.bbox[1]:.3f}, {block.bbox[2]:.3f}, {block.bbox[3]:.3f}]")
+                        st.write(f"**BBox:** [{block.bbox[0]:.1f}, {block.bbox[1]:.1f}, {block.bbox[2]:.1f}, {block.bbox[3]:.1f}]")
                         if block.content:
                             st.write(f"**Content:** {block.content[:200]}{'...' if len(block.content) > 200 else ''}")
-                        if block.metadata:
-                            st.write(f"**Metadata:** {block.metadata}")
                         st.divider()
                 
                 # Export results
@@ -704,29 +595,25 @@ if st.session_state.current_doc:
                 # Show original image
                 st.subheader("Original Document")
                 st.image(page_image, use_container_width=True)
-                st.info("Click 'Run Layout Detection' to analyze the document layout")
+                st.info("Select detection method and click the button above to analyze")
     else:
-        st.error("Document file not found")
+        st.error("PDF file not found")
 else:
     st.info("""
     ### Getting Started
-    1. Upload a PDF or image document using the sidebar
-    2. Load the detection model (optional, for better accuracy)
-    3. Navigate to the desired page (for PDFs)
-    4. Click "Run Layout Detection" to analyze the layout
+    1. Upload a PDF document using the sidebar
+    2. Choose detection method (HuggingPanda or CV fallback)
+    3. Load the model if using HuggingPanda
+    4. Navigate to the desired page
+    5. Click the detection button to analyze the layout
+    
+    ### Detection Methods
+    - **HuggingPanda/docling-layout**: Advanced neural network model for accurate detection
+    - **CV-based Fallback**: Simple computer vision method (always available, no model loading required)
     
     ### Features
-    - **Multiple Model Support**: Supports various layout detection models including LayoutLMv3, DETR, YOLO, and Detectron2
-    - **Enhanced CV Fallback**: Improved computer vision-based detection when ML models aren't available
-    - **Multi-category Detection**: Identifies text, tables, figures, equations, code blocks, headers, and more
-    - **Confidence Scores**: Shows detection confidence for each block
+    - **Multi-category Detection**: Identifies text, tables, figures, equations, code blocks, and more
+    - **Performance Tracking**: Built-in timing measurements for optimization
     - **Visual Feedback**: Color-coded bounding boxes for different content types
     - **Export Support**: Save detection results as JSON for further processing
-    
-    ### Supported Models
-    - **LayoutLMv3**: Microsoft's layout-aware language model
-    - **DETR**: Facebook's Detection Transformer
-    - **YOLO**: Real-time object detection
-    - **Detectron2**: Facebook's detection platform
-    - **CV Fallback**: Always available OpenCV-based detection
     """)

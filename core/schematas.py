@@ -87,13 +87,32 @@ class Label:
     def boundary_type(self) -> str:
         return "new_unit" if self.boundary == "new" else "continue_unit"
 
+
+# for visualization and later integration
+@dataclass
+class TextSpan:
+    """Original text span from document"""
+    page_number: int
+    span_id: str
+    bbox: Tuple[float, float, float, float]
+    text: str
+    font_size: float
+    bold: bool
+    italic: bool
+    line_height: float
+    x_center: float
+    y_bottom: float
+    column: int
+    reading_order: int
+
 @dataclass
 class SemanticUnit:
     """Collection of spans forming a logical document element"""
     unit_id: str
-    spans: List[Span]
+    spans: List[Any]  # Can be either Span or TextSpan
     unit_type: Optional[str] = None
     confidence: float = 1.0
+    page_number: Optional[int] = None  # Add this back as optional
     
     @property
     def text(self) -> str:

@@ -137,14 +137,13 @@ def create_semantic_units_from_labels(
         
         # Classify unit type
         unit_type = classify_unit_type(unit_spans)
-        
+                    
+        # In visualization.py, update the SemanticUnit creation:
         semantic_unit = SemanticUnit(
-            page_number=unit_data['page'],
             unit_id=unit_data['unit_id'],
-            unit_type=unit_type,
-            bbox=(min_x, min_y, max_x, max_y),
-            text=combined_text,
-            spans=text_spans
+            spans=text_spans,
+            unit_type=unit_type
+            # Remove page_number, bbox, and text - they're properties
         )
         semantic_units.append(semantic_unit)
     

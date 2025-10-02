@@ -74,8 +74,8 @@ class BoundaryModel:
         if self.calibrate and hasattr(self.model, 'calibrated_classifiers_'):
             # Store feature names in base estimator for consistency
             for clf in self.model.calibrated_classifiers_:
-                if hasattr(clf, 'base_estimator'):
-                    clf.base_estimator.feature_names_in_ = self.feature_names_in_
+                if hasattr(clf, 'estimator'):
+                    clf.estimator.feature_names_in_ = self.feature_names_in_
         
         # Evaluate on training set
         train_pred = self.model.predict(X_train)
@@ -114,8 +114,9 @@ class BoundaryModel:
             # Get average importance from calibrated classifiers
             importances_list = []
             for clf in self.model.calibrated_classifiers_:
-                if hasattr(clf.base_estimator, 'feature_importances_'):
-                    importances_list.append(clf.base_estimator.feature_importances_)
+                # Use 'estimator' instead of 'base_estimator'
+                if hasattr(clf, 'estimator') and hasattr(clf.estimator, 'feature_importances_'):
+                    importances_list.append(clf.estimator.feature_importances_)
             if importances_list:
                 importances = np.mean(importances_list, axis=0)
             else:
