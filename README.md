@@ -107,3 +107,6 @@ project/
 ## License
 
 MIT
+
+
+I tried mineru2, docling-layout-heron-101, docling-models, docling-layout

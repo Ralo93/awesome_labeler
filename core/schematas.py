@@ -6,7 +6,7 @@ import json
 
 @dataclass
 class Span:
-    """Immutable text span from PDF with enhanced boundary detection features"""
+    """Immutable text span from PDF with enhanced boundary detection and column features"""
     doc_id: str
     page_number: int
     span_id: str
@@ -18,7 +18,7 @@ class Span:
     line_height: float
     x_center: float
     y_bottom: float
-    column: int
+    column: int  # Now represents detected column index (0, 1, 2, ...)
     reading_order: int
     rotation: float = 0.0
     language: Optional[str] = None
@@ -43,13 +43,22 @@ class Span:
     is_last_on_page: bool = False
     relative_position: float = 0.0
     
+    # Column-aware features (NEW)
+    is_first_in_column: bool = False
+    is_last_in_column: bool = False
+    column_changed: bool = False  # True if different column from previous span
+    column_break: bool = False  # True if this starts a new column
+    horizontal_gap: float = 0.0  # Horizontal distance to previous span
+    num_columns_on_page: int = 1  # Total columns detected on page
+    next_column_different: bool = False  # True if next span is in different column
+    
     # Sequential context (populated by _add_sequence_features)
     prev_font_size: float = 0.0
     prev_is_bold: bool = False
     prev_ends_period: bool = False
     font_size_changed: bool = False
     style_changed: bool = False
-    vertical_gap: float = 0.0
+    vertical_gap: float = 0.0  # Now column-aware
     next_font_size: float = 0.0
     next_starts_bullet: bool = False
     reading_order_gap: int = 1
@@ -71,6 +80,11 @@ class Span:
     @property
     def y_bottom_coord(self) -> float:
         return self.bbox[3]
+    
+    @property
+    def is_multi_column_page(self) -> bool:
+        """Check if this span is on a multi-column page"""
+        return self.num_columns_on_page > 1
 
 @dataclass
 class Label:
@@ -87,8 +101,6 @@ class Label:
     def boundary_type(self) -> str:
         return "new_unit" if self.boundary == "new" else "continue_unit"
 
-
-# for visualization and later integration
 @dataclass
 class TextSpan:
     """Original text span from document"""
@@ -131,6 +143,14 @@ class SemanticUnit:
         y1 = max(span.bbox[3] for span in self.spans)
         
         return (x0, y0, x1, y1)
+    
+    @property
+    def crosses_columns(self) -> bool:
+        """Check if this semantic unit spans multiple columns"""
+        if not self.spans:
+            return False
+        columns = set(span.column for span in self.spans if hasattr(span, 'column'))
+        return len(columns) > 1
 
 @dataclass
 class Document:
