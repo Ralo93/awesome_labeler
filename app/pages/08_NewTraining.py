@@ -20,7 +20,7 @@ st.set_page_config(page_title="Training", page_icon="🚀", layout="wide")
 
 AppState.init()
 
-st.title("🚀 Model Training")
+st.title("🚀 2 Model Training")
 
 st.markdown("""
 Train boundary detection models from your labeled documents. The trained model will be available 
@@ -163,14 +163,15 @@ def get_efficient_model_params(n_samples, n_features):
     
     return params
 
-def train_model_with_doc_split(data_path: Path, model_name: str, test_size: float = 0.25):
+def train_model_with_optional_split(data_path: Path, model_name: str, test_size: float = 0.25, use_all_data: bool = False):
     """
-    Train model with document-level train/test split.
+    Train model with optional document-level train/test split.
     
     Args:
         data_path: Path to the parquet file
         model_name: Name for the saved model
         test_size: Fraction of documents for testing (default 0.25)
+        use_all_data: If True, train on all data without splitting
     
     Returns:
         dict: Training results and metrics
@@ -186,9 +187,17 @@ def train_model_with_doc_split(data_path: Path, model_name: str, test_size: floa
         if 'y_boundary' not in df.columns:
             raise ValueError("Training data missing 'y_boundary' column")
         
-        # Step 2: Document-level split
-        progress_bar.progress(20, text="Performing document-level split...")
-        train_df, test_df = perform_document_split(df, test_size=test_size)
+        # Step 2: Split or use all data
+        if use_all_data:
+            progress_bar.progress(20, text="Using all data for training (no split)...")
+            train_df = df.copy()
+            test_df = None
+            
+            # Display info
+            st.info(f"🎯 Training on **all {len(df):,} examples** from **{len(df['doc_id'].unique()) if 'doc_id' in df.columns else 'N/A'} documents** (no test split)")
+        else:
+            progress_bar.progress(20, text="Performing document-level split...")
+            train_df, test_df = perform_document_split(df, test_size=test_size)
         
         # Get feature count (excluding target and metadata columns)
         feature_cols = [col for col in train_df.columns 
@@ -205,10 +214,14 @@ def train_model_with_doc_split(data_path: Path, model_name: str, test_size: floa
             with col1:
                 st.write("**Dataset Statistics:**")
                 st.write(f"- Training samples: {len(train_df):,}")
-                st.write(f"- Test samples: {len(test_df):,}")
+                if test_df is not None:
+                    st.write(f"- Test samples: {len(test_df):,}")
+                else:
+                    st.write(f"- Test samples: N/A (using all data)")
                 st.write(f"- Features: {n_features}")
                 st.write(f"- Positive rate (train): {train_df['y_boundary'].mean():.2%}")
-                st.write(f"- Positive rate (test): {test_df['y_boundary'].mean():.2%}")
+                if test_df is not None:
+                    st.write(f"- Positive rate (test): {test_df['y_boundary'].mean():.2%}")
             with col2:
                 st.write("**Model Parameters:**")
                 for param, value in model_params.items():
@@ -223,16 +236,18 @@ def train_model_with_doc_split(data_path: Path, model_name: str, test_size: floa
         progress_bar.progress(50, text="Training model...")
         training_metrics = model.train(train_df, test_df)
         
-        # Step 6: Evaluate model
-        progress_bar.progress(70, text="Evaluating model performance...")
-        test_metrics = evaluate_model_performance(model, test_df)
+        # Step 6: Evaluate model (only if test_df exists)
+        if test_df is not None:
+            progress_bar.progress(70, text="Evaluating model performance...")
+            test_metrics = evaluate_model_performance(model, test_df)
+        else:
+            test_metrics = None
         
-        # Step 7: Cross-validation for robustness (optional)
-        if len(df['doc_id'].unique()) >= 4:
+        # Step 7: Cross-validation for robustness (optional and only if not using all data)
+        cv_scores = None
+        if not use_all_data and 'doc_id' in df.columns and len(df['doc_id'].unique()) >= 4:
             progress_bar.progress(80, text="Performing cross-validation...")
             cv_scores = perform_cross_validation(df, model_params)
-        else:
-            cv_scores = None
         
         # Step 8: Save model
         progress_bar.progress(90, text="Saving model...")
@@ -248,14 +263,15 @@ def train_model_with_doc_split(data_path: Path, model_name: str, test_size: floa
             'model_name': model_name,
             'model_params': model_params,
             'train_metrics': training_metrics.get('train_metrics', {}),
-            'test_metrics': test_metrics,
+            'test_metrics': test_metrics if test_metrics else {},
             'cv_scores': cv_scores,
             'n_train_samples': len(train_df),
-            'n_test_samples': len(test_df),
+            'n_test_samples': len(test_df) if test_df is not None else 0,
             'n_train_docs': len(train_df['doc_id'].unique()) if 'doc_id' in train_df.columns else 'N/A',
-            'n_test_docs': len(test_df['doc_id'].unique()) if 'doc_id' in test_df.columns else 'N/A',
+            'n_test_docs': len(test_df['doc_id'].unique()) if test_df is not None and 'doc_id' in test_df.columns else 'N/A',
             'feature_count': n_features,
             'feature_importance': training_metrics.get('feature_importance', [])[:20],  # Top 20
+            'trained_on_all_data': use_all_data,
             'created_at': datetime.now().isoformat()
         }
         
@@ -411,7 +427,7 @@ if st.button("📊 Analyze Dataset"):
 # Training Configuration
 st.header("⚙️ Training Configuration")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns([2, 1, 1])
 
 with col1:
     model_name = st.text_input(
@@ -421,14 +437,26 @@ with col1:
     )
 
 with col2:
-    test_size = st.slider(
-        "Test Document Fraction",
-        min_value=0.1,
-        max_value=0.4,
-        value=0.25,
-        step=0.05,
-        help="Fraction of documents to use for testing (document-level split)"
+    use_all_data = st.checkbox(
+        "Train on all data",
+        value=False,
+        help="Train on entire dataset without train/test split. Use this for final production models after validation."
     )
+
+with col3:
+    # Only show test size slider if not using all data
+    if not use_all_data:
+        test_size = st.slider(
+            "Test Document Fraction",
+            min_value=0.1,
+            max_value=0.4,
+            value=0.25,
+            step=0.05,
+            help="Fraction of documents to use for testing (document-level split)"
+        )
+    else:
+        test_size = 0.25  # Default value, won't be used
+        st.info("ℹ️ No test split - using 100% of data for training")
 
 # Training Section
 st.header("🚀 Train Model")
@@ -440,16 +468,24 @@ with col1:
         "🚀 Start Training", 
         type="primary", 
         use_container_width=True,
-        help="Train model with document-level train/test split"
+        help="Train model with selected configuration"
     )
 
 with col2:
-    st.info(f"""
-    **Split Strategy:**
-    - Document-level split
-    - Test on unseen docs
-    - Better generalization
-    """)
+    if use_all_data:
+        st.warning(f"""
+        **⚠️ No Validation:**
+        - Training on all data
+        - No test metrics
+        - Use after validation
+        """)
+    else:
+        st.info(f"""
+        **Split Strategy:**
+        - Document-level split
+        - Test on unseen docs
+        - Better generalization
+        """)
 
 with col3:
     st.info(f"""
@@ -463,12 +499,13 @@ if train_button:
     if not model_name.strip():
         st.error("Please enter a model name")
     else:
-        with st.spinner("Training model with document-level split..."):
+        with st.spinner("Training model..."):
             try:
-                results = train_model_with_doc_split(
+                results = train_model_with_optional_split(
                     data_path=selected_dataset['path'],
                     model_name=model_name.strip(),
-                    test_size=test_size
+                    test_size=test_size if not use_all_data else 0.25,
+                    use_all_data=use_all_data
                 )
                 
                 st.session_state.training_results = results
@@ -484,26 +521,47 @@ if st.session_state.training_results:
     
     results = st.session_state.training_results
     
+    # Check if trained on all data
+    trained_on_all = results.get('trained_on_all_data', False)
+    
+    if trained_on_all:
+        st.warning("🎯 **Model trained on all available data** - No test metrics available")
+    
     # Main metrics
-    col1, col2, col3, col4 = st.columns(4)
+    if trained_on_all:
+        # Show only training metrics when no split
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
+            st.metric("Training AUC", f"{train_auc:.3f}")
+        
+        with col2:
+            st.metric("Features Used", results.get('feature_count', 'N/A'))
+        
+        with col3:
+            st.metric("Total Samples", f"{results.get('n_train_samples', 0):,}")
+    else:
+        # Show train and test metrics when split is used
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
+            st.metric("Training AUC", f"{train_auc:.3f}")
+        
+        with col2:
+            test_auc = results.get('test_metrics', {}).get('auc_roc', 0)
+            delta = test_auc - train_auc if train_auc > 0 else 0
+            st.metric("Test AUC", f"{test_auc:.3f}", delta=f"{delta:+.3f}")
+        
+        with col3:
+            st.metric("Features Used", results.get('feature_count', 'N/A'))
+        
+        with col4:
+            st.metric("Test Docs", results.get('n_test_docs', 'N/A'))
     
-    with col1:
-        train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
-        st.metric("Training AUC", f"{train_auc:.3f}")
-    
-    with col2:
-        test_auc = results.get('test_metrics', {}).get('auc_roc', 0)
-        delta = test_auc - train_auc if train_auc > 0 else 0
-        st.metric("Test AUC", f"{test_auc:.3f}", delta=f"{delta:+.3f}")
-    
-    with col3:
-        st.metric("Features Used", results.get('feature_count', 'N/A'))
-    
-    with col4:
-        st.metric("Test Docs", results.get('n_test_docs', 'N/A'))
-    
-    # Cross-validation results (if available)
-    if results.get('cv_scores'):
+    # Cross-validation results (if available - only shown when not training on all data)
+    if results.get('cv_scores') and not trained_on_all:
         st.subheader("🔄 Cross-Validation Results")
         cv_scores = results['cv_scores']
         
@@ -522,23 +580,31 @@ if st.session_state.training_results:
             })
             st.dataframe(fold_df, use_container_width=True)
     
-    # Performance interpretation
-    test_auc = results.get('test_metrics', {}).get('auc_roc', 0)
-    train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
-    
-    if test_auc > 0:
-        if test_auc >= 0.85:
-            st.success("🎯 **Excellent Performance!** Model is ready for production use.")
-        elif test_auc >= 0.75:
-            st.info("✅ **Good Performance!** Model is usable but could benefit from more labeled data.")
-        elif test_auc >= 0.65:
-            st.warning("⚠️ **Fair Performance.** Consider labeling more documents for better results.")
-        else:
-            st.error("❌ **Poor Performance.** Need more diverse labeled examples.")
+    # Performance interpretation (only if we have test metrics)
+    if not trained_on_all:
+        test_auc = results.get('test_metrics', {}).get('auc_roc', 0)
+        train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
         
-        # Check for overfitting
-        if train_auc - test_auc > 0.1:
-            st.warning("⚠️ **Potential Overfitting Detected!** Large gap between train and test AUC. Consider labeling more diverse documents.")
+        if test_auc > 0:
+            if test_auc >= 0.85:
+                st.success("🎯 **Excellent Performance!** Model is ready for production use.")
+            elif test_auc >= 0.75:
+                st.info("✅ **Good Performance!** Model is usable but could benefit from more labeled data.")
+            elif test_auc >= 0.65:
+                st.warning("⚠️ **Fair Performance.** Consider labeling more documents for better results.")
+            else:
+                st.error("❌ **Poor Performance.** Need more diverse labeled examples.")
+            
+            # Check for overfitting
+            if train_auc - test_auc > 0.1:
+                st.warning("⚠️ **Potential Overfitting Detected!** Large gap between train and test AUC. Consider labeling more diverse documents.")
+    else:
+        # Show guidance for all-data training
+        train_auc = results.get('train_metrics', {}).get('auc_roc', 0)
+        if train_auc >= 0.9:
+            st.info("📊 High training AUC. Model has learned the training data well. Consider validating on new documents before production use.")
+        else:
+            st.warning("📊 Moderate training AUC. Model may need more diverse training examples.")
     
     # Feature importance chart
     if results.get('feature_importance'):
@@ -569,10 +635,11 @@ if st.session_state.training_results:
         display_info = {
             'model_name': results['model_name'],
             'model_path': results['model_path'],
+            'trained_on_all_data': results.get('trained_on_all_data', False),
             'training_samples': results.get('n_train_samples', 'N/A'),
-            'test_samples': results.get('n_test_samples', 'N/A'),
+            'test_samples': results.get('n_test_samples', 'N/A') if not trained_on_all else 'N/A (no split)',
             'training_documents': results.get('n_train_docs', 'N/A'),
-            'test_documents': results.get('n_test_docs', 'N/A'),
+            'test_documents': results.get('n_test_docs', 'N/A') if not trained_on_all else 'N/A (no split)',
             'created_at': results['created_at']
         }
         st.json(display_info)
@@ -602,16 +669,31 @@ if models_dir.exists():
                             
                             train_metrics = metadata.get('train_metrics', {})
                             test_metrics = metadata.get('test_metrics', {})
+                            trained_on_all = metadata.get('trained_on_all_data', False)
                             
+                            # Show training type
+                            if trained_on_all:
+                                st.write("🎯 **Training Type**: All data (no split)")
+                            else:
+                                st.write("📊 **Training Type**: Train/test split")
+                            
+                            # Show metrics
                             st.write(f"**Training AUC**: {train_metrics.get('auc_roc', 'N/A')}")
-                            st.write(f"**Test AUC**: {test_metrics.get('auc_roc', 'N/A')}")
                             
-                            if metadata.get('cv_scores'):
-                                cv = metadata['cv_scores']
-                                st.write(f"**CV AUC**: {cv.get('auc_mean', 0):.3f} ± {cv.get('auc_std', 0):.3f}")
+                            if not trained_on_all and test_metrics:
+                                st.write(f"**Test AUC**: {test_metrics.get('auc_roc', 'N/A')}")
+                                
+                                if metadata.get('cv_scores'):
+                                    cv = metadata['cv_scores']
+                                    st.write(f"**CV AUC**: {cv.get('auc_mean', 0):.3f} ± {cv.get('auc_std', 0):.3f}")
                             
                             st.write(f"**Features**: {metadata.get('feature_count', 'N/A')}")
-                            st.write(f"**Train/Test Docs**: {metadata.get('n_train_docs', 'N/A')} / {metadata.get('n_test_docs', 'N/A')}")
+                            
+                            if trained_on_all:
+                                st.write(f"**Training Samples**: {metadata.get('n_train_samples', 'N/A')}")
+                                st.write(f"**Training Docs**: {metadata.get('n_train_docs', 'N/A')}")
+                            else:
+                                st.write(f"**Train/Test Docs**: {metadata.get('n_train_docs', 'N/A')} / {metadata.get('n_test_docs', 'N/A')}")
                             
                         except Exception as e:
                             st.write("Metadata not available")

@@ -4,8 +4,11 @@ from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Optional, Dict
 from core.schematas import Span, Label
 
-def get_unit_color(unit_index: int, alpha: int = 80) -> Tuple[int, int, int, int]:
-    """Get color for a unit based on index"""
+def get_unit_color(unit_id: str, alpha: int = 80) -> Tuple[int, int, int, int]:
+    """
+    Get consistent color for a unit based on its ID.
+    Uses a hash of the unit_id to ensure consistent colors across sessions.
+    """
     colors = [
         (255, 107, 107),  # Red
         (107, 255, 161),  # Green  
@@ -16,7 +19,22 @@ def get_unit_color(unit_index: int, alpha: int = 80) -> Tuple[int, int, int, int
         (107, 255, 239),  # Cyan
         (239, 255, 107),  # Yellow
     ]
-    base_color = colors[unit_index % len(colors)]
+    
+    # Extract unit number from unit_id (e.g., "unit_42" -> 42)
+    # This ensures consistent coloring based on unit number
+    try:
+        if unit_id.startswith('unit_'):
+            unit_num = int(unit_id.split('_')[1])
+        else:
+            # Fallback: use hash for non-standard unit IDs
+            unit_num = hash(unit_id)
+    except (ValueError, IndexError):
+        # Fallback: use hash if parsing fails
+        unit_num = hash(unit_id)
+    
+    # Use modulo to select color consistently
+    color_index = unit_num % len(colors)
+    base_color = colors[color_index]
     return (*base_color, alpha)
 
 def draw_overlay(
@@ -44,32 +62,40 @@ def draw_overlay(
         except:
             font = ImageFont.load_default()
     
-    # First pass: Group spans by unit
+    # First pass: Group spans by unit and collect all unit IDs
     units = {}
-    unit_order = {}
+    all_unit_ids = set()
     
     for span in spans:
         key = (span.page_number, span.span_id)
         if key in labels:
             label = labels[key]
             unit_id = label.unit_id
+            all_unit_ids.add(unit_id)
             
             if unit_id not in units:
                 units[unit_id] = []
-                unit_order[unit_id] = len(unit_order)
             units[unit_id].append(span)
     
-    # Sort units by reading order of first span in each unit
-    sorted_units = []
-    for unit_id, unit_spans in units.items():
-        # Find first span by reading order
-        first_span = min(unit_spans, key=lambda s: s.reading_order or 999999)
-        sorted_units.append((first_span.reading_order or 999999, unit_id, unit_spans))
-    sorted_units.sort()
+    # Sort unit IDs consistently for numbering (based on unit number if possible)
+    sorted_unit_ids = []
+    for unit_id in all_unit_ids:
+        try:
+            if unit_id.startswith('unit_'):
+                unit_num = int(unit_id.split('_')[1])
+                sorted_unit_ids.append((unit_num, unit_id))
+            else:
+                # Non-standard unit IDs go at the end
+                sorted_unit_ids.append((float('inf'), unit_id))
+        except (ValueError, IndexError):
+            sorted_unit_ids.append((float('inf'), unit_id))
     
-    # Draw units (background colors)
+    sorted_unit_ids.sort()
+    unit_id_to_number = {unit_id: idx + 1 for idx, (_, unit_id) in enumerate(sorted_unit_ids)}
+    
+    # Draw units (background colors) with consistent colors
     for unit_id, unit_spans in units.items():
-        color = get_unit_color(unit_order[unit_id], alpha=40)
+        color = get_unit_color(unit_id, alpha=40)
         
         for span in unit_spans:
             # Scale bbox if needed
@@ -78,23 +104,40 @@ def draw_overlay(
             # Draw filled rectangle for unit
             draw.rectangle(bbox, fill=color, outline=None)
     
+    # Sort units by reading order of first span in each unit (for display numbering)
+    sorted_units = []
+    for unit_id, unit_spans in units.items():
+        # Find first span by reading order
+        first_span = min(unit_spans, key=lambda s: (s.page_number, s.reading_order if s.reading_order else 999999))
+        sorted_units.append((first_span.reading_order or 999999, unit_id, unit_spans))
+    sorted_units.sort()
+    
     # Draw semantic unit numbers
     if show_unit_numbers and sorted_units:
-        for unit_idx, (_, unit_id, unit_spans) in enumerate(sorted_units):
+        for _, unit_id, unit_spans in sorted_units:
+            # Only draw number if unit has spans on current page
+            page_unit_spans = [s for s in unit_spans if hasattr(s, 'page_number')]
+            if not page_unit_spans:
+                continue
+                
             # Find the topmost, leftmost span in the unit for positioning
-            first_span = min(unit_spans, key=lambda s: (s.bbox[1], s.bbox[0]))
+            first_span = min(page_unit_spans, key=lambda s: (s.bbox[1], s.bbox[0]))
             
             bbox = [coord * zoom for coord in first_span.bbox]
             x0, y0 = bbox[0], bbox[1]
             
-            # Unit number text
-            unit_num = unit_idx + 1
+            # Use the consistent unit number
+            unit_num = unit_id_to_number.get(unit_id, 999)
             unit_text = f"#{unit_num}"
             
             # Get text dimensions for box sizing
-            text_bbox = draw.textbbox((0, 0), unit_text, font=font)
-            text_width = text_bbox[2] - text_bbox[0]
-            text_height = text_bbox[3] - text_bbox[1]
+            try:
+                text_bbox = draw.textbbox((0, 0), unit_text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+            except AttributeError:
+                # Fallback for older PIL versions
+                text_width, text_height = draw.textsize(unit_text, font=font)
             
             # Box padding
             padding = int(3 * zoom)
@@ -105,10 +148,15 @@ def draw_overlay(
             box_x = max(0, x0 - int(5 * zoom))
             box_y = max(0, y0 - box_height - int(5 * zoom))
             
-            # Draw unit number box background (dark blue)
+            # Use consistent color for the box based on unit_id
+            box_color = get_unit_color(unit_id, alpha=230)
+            # Make the box background darker version of unit color
+            dark_color = tuple(int(c * 0.3) for c in box_color[:3]) + (230,)
+            
+            # Draw unit number box background
             draw.rectangle(
                 [box_x, box_y, box_x + box_width, box_y + box_height],
-                fill=(25, 25, 112, 230),  # Dark blue background
+                fill=dark_color,
                 outline=(255, 255, 255, 255),  # White border
                 width=max(1, int(zoom))
             )
@@ -119,13 +167,12 @@ def draw_overlay(
             draw.text((text_x, text_y), unit_text, fill=(255, 255, 255, 255), font=font)
     
     # Draw predictions/confidence if available
-    # FIXED: Handle predictions with (page_number, span_id) keys
     if show_heatmap and predictions:
         margin = 10 * zoom
         bar_width = 8 * zoom
         
         # Sort spans by reading order for proper visualization
-        sorted_spans = sorted(spans, key=lambda s: s.reading_order)
+        sorted_spans = sorted(spans, key=lambda s: (s.page_number, s.reading_order if hasattr(s, 'reading_order') else 999999))
         
         for span in sorted_spans:
             key = (span.page_number, span.span_id)

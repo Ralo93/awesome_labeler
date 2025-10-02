@@ -82,8 +82,8 @@ if selected_doc:
     total_spans = len(spans)
     labeled_spans = len(labels)
     
-    # Count unique units
-    unique_units = len(set(l.unit_id for l in labels)) if labels else 0
+    # Count unique units - FIX: labels is a dict, need to iterate over values
+    unique_units = len(set(l.unit_id for l in labels.values())) if labels else 0
     
     # Display metrics
     col1, col2, col3, col4 = st.columns(4)
@@ -103,8 +103,8 @@ if selected_doc:
     # Coverage indicator
     if total_spans > 0:
         coverage = labeled_spans / total_spans
-        coverage_ratio = _normalize_progress(coverage)
-        st.progress(coverage_ratio, text=f"Coverage: {coverage_ratio:.1%} of spans labeled")
+        coverage_ratio = _normalize_progress(coverage * 100)  # Convert to percentage
+        st.progress(coverage_ratio, text=f"Coverage: {coverage:.1%} of spans labeled")
     
     st.divider()
     
