@@ -55,14 +55,3 @@ def show_feature_panel(
     
     df = pd.DataFrame(data)
     st.dataframe(df, use_container_width=True, hide_index=True)
-    
-    # Show bounding boxes for debugging (following debugging patterns)
-    #if st.checkbox("Show Bounding Boxes"):
-    #    st.json({
-    #        span.span_id: {
-    #            'bbox': span.bbox,
-    #            'page': span.page_number,
-    #            'text_preview': span.text[:50]
-    #        }
-    #        for span in selected_objs
-    #    })

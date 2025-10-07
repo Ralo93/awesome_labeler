@@ -12,9 +12,8 @@ from sklearn.model_selection import GroupKFold
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from app.state import AppState
-from core.exports import export_training_data
-from core.models import BoundaryModel, train_boundary_model, evaluate_model_performance
-from core.io import load_spans, load_labels
+from core.models import BoundaryModel, evaluate_model_performance
+
 
 st.set_page_config(page_title="Training", page_icon="🚀", layout="wide")
 
@@ -133,27 +132,18 @@ def get_efficient_model_params(n_samples, n_features):
         params.update({
             'n_estimators': 100,
             'max_depth': 10,
-            #'min_samples_split': 20,
-            #'min_samples_leaf': 10,
-            #'max_features': 'sqrt'
         })
     elif n_samples < 5000:
         # Medium dataset
         params.update({
             'n_estimators': 150,
             'max_depth': 15,
-            #'min_samples_split': 10,
-            #'min_samples_leaf': 5,
-            #'max_features': 'sqrt'
         })
     else:
         # Large dataset
         params.update({
             'n_estimators': 200,
             'max_depth': 20,
-            #'min_samples_split': 5,
-            #'min_samples_leaf': 2,
-            #'max_features': 'sqrt'
         })
     
     # Further optimization for very small datasets
